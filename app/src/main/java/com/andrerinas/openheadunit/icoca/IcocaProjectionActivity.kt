@@ -34,13 +34,26 @@ class IcocaProjectionActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // ★ 必须锁横屏。SDK 是按 landscape 画布协商的（setScreenSize 传的就是
+        //   max/min），如果这里跟随传感器，手机竖着拿时 Surface 会变成 1260x2800，
+        //   与协商尺寸相反 —— 日志里就是 "surfaceChanged 1260x2800" 配
+        //   "startCast(2800x1260)"，方向对不上，媒体协商直接失败。
+        requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
         // A projection session can run for a long time; never let the panel sleep mid-drive.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(R.layout.activity_icoca_projection)
         hideSystemUi()
 
         val bridge = App.provide(this).icocaBridge
-        findViewById<SurfaceView>(R.id.icoca_surface).holder.addCallback(
+        val surfaceView = findViewById<SurfaceView>(R.id.icoca_surface)
+        // ★ 触控回传（UIBC）。SDK 有 sendTouchEvent()，但上游从未调用 —— 车机上点什么都
+        //   不会有反应，看起来就像「画面冻住了」。这里把每一次触摸按 View 实际尺寸归一化后
+        //   交给 SDK，由它映射到手机屏幕坐标。
+        surfaceView.setOnTouchListener { view, event ->
+            bridge.sendTouch(event, view.width, view.height)
+            true
+        }
+        surfaceView.holder.addCallback(
             object : SurfaceHolder.Callback {
                 override fun surfaceCreated(holder: SurfaceHolder) {
                     AppLog.i("ICCOA projection: surfaceCreated")

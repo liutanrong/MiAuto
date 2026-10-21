@@ -39,6 +39,14 @@ public class IccoaManager {
         void onLog(String msg);
         /** 已连接状态变化：0 断开 / 1 连接中 / 2 已连接 / 3 已建立 */
         void onConnectionState(int state);
+        /**
+         * 连接进度 0..100。
+         *
+         * <p>暴露它的唯一目的：让宿主能在进度过半时就准备好 Surface。ICCOA 的 RTSP
+         * 协商需要 sink 端的 Surface 已存在，而 Surface 只在投屏页里才有 —— 如果等到
+         * Connected 才打开投屏页，会形成死锁：没 Surface → 协商停在 80% → 永远不 Connected。
+         */
+        void onProgress(int progress);
         void onPinCode(String pinCode, String carDeviceName);
         void onCastStarted();
         /** 手机导航信息（POC-2 / BYD 仪表与 HUD 的数据源）。 */
@@ -63,7 +71,11 @@ public class IccoaManager {
     private volatile String lastPinCode = null;
 
     /** 会话结束后重新广播的延时：留出 SDK 内部收尾时间，避免与断连流程竞争。 */
-    private static final long RE_ADVERTISE_DELAY_MS = 1200L;
+    // ★ 从 1.2 秒提高到 5 秒。断开一个 P2P 组之后，Android 的 wpa_supplicant 需要几秒
+    //   才能真正拆除 group interface；期间重新 startAdvertise()，新会话会在 36 毫秒内
+    //   被对端直接拒掉（progress 10 → 0 → 10003），而不是等 15 秒超时 —— 两种失败形态
+    //   在日志里能明显区分。留足拆除时间，重连才稳定。
+    private static final long RE_ADVERTISE_DELAY_MS = 5000L;
 
     /**
      * 配对码自动刷新周期。
@@ -127,6 +139,37 @@ public class IccoaManager {
         main.removeCallbacks(autoRefreshRunnable);
     }
 
+    /**
+     * 协商超时兜底。
+     *
+     * <p>原逻辑刻意不把 CONNECTING（newState==1）算作 sessionActive，理由是「协商卡死时
+     * 让看门狗重播救回来」。但实测（vivo X200s / Android 10）暴露了反面：一旦进入
+     * CONNECTING，30 秒看门狗照常 stop→start 重播，正在进行的鉴权被连根拔掉，
+     * 日志里表现为「progress 10 → 自动刷新 → progress 0 + 10008」。
+     *
+     * <p>现在改成：CONNECTING 也置 sessionActive（不再打断协商），另设一个比看门狗更长的
+     * 协商超时；超时仍未连上才放开 sessionActive 并重播。这样既不打断正常协商，
+     * 也不会永久卡死。
+     */
+    private static final long CONNECTING_TIMEOUT_MS = 45_000L;
+
+    private final Runnable connectingTimeoutRunnable = () -> {
+        if (!sessionActive || castStarted) return;
+        log("★ 协商超时（" + (CONNECTING_TIMEOUT_MS / 1000) + " 秒未建立连接）→ 强制重播");
+        sessionActive = false;
+        reAdvertise();
+        scheduleAutoRefresh();
+    };
+
+    private void scheduleConnectingTimeout() {
+        main.removeCallbacks(connectingTimeoutRunnable);
+        main.postDelayed(connectingTimeoutRunnable, CONNECTING_TIMEOUT_MS);
+    }
+
+    private void cancelConnectingTimeout() {
+        main.removeCallbacks(connectingTimeoutRunnable);
+    }
+
     // ---- 屏幕尺寸 ----
     private int screenW = 1920, screenH = 720, videoW = 1920, videoH = 720;
 
@@ -136,15 +179,54 @@ public class IccoaManager {
     }
 
     public void setScreenSize(int w, int h) {
-        screenW = w; screenH = h; videoW = w; videoH = h;
+        screenW = Math.max(1, w);
+        screenH = Math.max(1, h);
+        // ★ 投屏画布上限跟随「视频分辨率」设置项（Settings.resolutionId）。
+        //   默认 720p：1920x990@30 约 190 万像素/帧，H.264 码率 8~12 Mbps，而车机走的是
+        //   SoftAP（2.4GHz，实际吞吐 20~30 Mbps 且抖动大），余量撑不住稳定 30fps。
+        //   降到 720p 级（约 85 万像素）码率减半。想更清晰就去设置里切 1080p，想更流畅切 480p，
+        //   不需要重新编译。
+        int capW = 1280, capH = 720;
+        try {
+            int rid = new com.andrerinas.openheadunit.utils.Settings(appCtx).getResolutionId();
+            switch (rid) {
+                case 1: capW = 800;  capH = 480;  break;   // 480p
+                case 3: capW = 1920; capH = 1080; break;   // 1080p
+                case 4: capW = 2560; capH = 1440; break;   // 2K
+                case 5: capW = 3840; capH = 2160; break;   // 4K
+                default: break;                            // 0=auto / 2=720p
+            }
+        } catch (Throwable t) {
+            log("读取分辨率设置失败，按 720p 处理: " + t);
+        }
+        float scale = Math.min(1f, Math.min((float) capW / screenW, (float) capH / screenH));
+        videoW = Math.max(1, Math.round(screenW * scale));
+        videoH = Math.max(1, Math.round(screenH * scale));
+        // ★ 向上对齐到 16 的倍数。H.264 宏块是 16x16，1920x990 的 990 不是倍数
+        //   （990/16=61.875），部分解码器在这种高度上只出首帧就不再出帧 ——
+        //   现象正是「有第一屏、之后完全不动」。对齐到 992 不改观感，但让解码器走常规路径。
+        videoW = Math.min(capW, ((videoW + 15) / 16) * 16);
+        videoH = Math.min(capH, ((videoH + 15) / 16) * 16);
+        log("投屏尺寸: 面板 " + screenW + "x" + screenH + " → 视频 " + videoW + "x" + videoH
+                + "（上限 " + capW + "x" + capH + "，已按 16 对齐）");
     }
 
     public String getLastPinCode() { return lastPinCode; }
 
     /** Surface 就绪 / 变化（Activity 的 surfaceChanged 回调里调用）。 */
     public void setSurface(Surface s) {
+        // 同一个 Surface 的重复回调（surfaceChanged 会再次进来）直接忽略：
+        // SDK 自己会处理尺寸变化，这里再 startCast 一次只会打断正在进行的媒体协商。
+        if (s != null && s == this.surface) return;
         this.surface = s;
         castRetry = 0;          // 新 Surface 到位，重试预算重置
+        // ★ Surface 重建（旋转屏、切后台再回来、Activity 重建）后必须允许重新投。
+        //   原实现只重置重试预算，但 tryStartCast() 首行就是 "castStarted 则 return"，
+        //   而 castStarted 仍为 true —— 新 Surface 永远拿不到流，表现为永久黑屏。
+        if (castStarted) {
+            log("Surface 重建 → 重置 castStarted，重新 startCast");
+            castStarted = false;
+        }
         tryStartCast();
     }
 
@@ -155,6 +237,9 @@ public class IccoaManager {
     /** 启动（或重启）投屏链路。权限由调用方（Activity）负责。 */
     public void start() {
         log("=== 启动（ICCOA CarWith）===");
+        // 每次开始新会话都重置触控日志预算，否则第一次调试用完 12 条之后，
+        // 后续连接里的触摸将完全不留痕迹（曾经因此误判为「事件没到」）。
+        touchLogBudget = 12;
         if (sdkInitialized && adapter != null) {
             log("重启：SDK 已初始化，仅重新广播");
             reAdvertise();
@@ -185,6 +270,20 @@ public class IccoaManager {
                 log("★ onInitSuccess()");
                 sdkReady = true;
                 sdkInitialized = true;   // ★ init-once 守门
+
+                // ★ 打开 SDK 的 AOA(USB) 通道检测。
+                //   SDK 默认关闭这个开关，而上游 MiAuto 从未调用过它 —— 结果是插线后
+                //   只有基座残留的 Android Auto 握手在跑（日志里的 "Start Aap transport
+                //   handshake"），ICCOA 自己的 libusbio.so 根本不会接管 USB 设备。
+                //   打开后 SDK 会自行 UsbManager.requestPermission()，走 AOA 建链，
+                //   完全不依赖 Wi-Fi P2P / SoftAP。
+                try {
+                    adapter.enableUsbDeviceDetection(true);
+                    log("✓ enableUsbDeviceDetection(true) —— AOA 有线通道已启用");
+                } catch (Throwable t) {
+                    log("✗ enableUsbDeviceDetection 失败: " + t);
+                }
+
                 main.post(() -> safe("doAdvertise", IccoaManager.this::doAdvertise));
                 main.post(IccoaManager.this::scheduleAutoRefresh);   // ★ 启动配对码看门狗
             }
@@ -306,7 +405,9 @@ public class IccoaManager {
         castRetry = 0;
         boolean ok = adapter.startCast(s, videoW, videoH);
         castStarted = ok;
-        log((ok ? "✓ " : "✗ ") + "startCast(" + videoW + "x" + videoH + ") = " + ok);
+        log((ok ? "✓ " : "✗ ") + "startCast(" + videoW + "x" + videoH + ") = " + ok
+                + " surfaceValid=" + s.isValid()
+                + " panel=" + screenW + "x" + screenH);
         if (ok) {
             main.post(listener::onCastStarted);
         }
@@ -328,22 +429,50 @@ public class IccoaManager {
 
         @Override
         public void onConnectStateChanged(String deviceID, int oldState, int newState) {
-            log("onConnectStateChanged " + stateName(oldState) + " -> " + stateName(newState));
+            // ★ 带上 deviceID。多台手机同时在场时，光看状态码分不清是「同一台在重试」
+            //   还是「不同设备在互相顶掉」——这两者的处理方式完全不同。
+            log("onConnectStateChanged dev=" + shortId(deviceID)
+                    + " " + stateName(oldState) + " -> " + stateName(newState));
             if (newState == 0 && oldState != 0) {
                 // 会话真正结束（不是启动时的初始 DISCONNECTED）。清掉已过期的配对码并延时重新
                 // 广播：手机端 CarWith 会重新发现车机并触发一次全新配对（新的 onPinCode）。
                 sessionActive = false;
                 lastPinCode = null;
                 castStarted = false;
+                cancelConnectingTimeout();
                 scheduleReAdvertise();
                 scheduleAutoRefresh();
+            } else if (newState == 1) {
+                // ★ 协商中：也要置 sessionActive，否则 30 秒看门狗会在鉴权进行到一半时
+                //   stop→start 重播，把正在跑的会话连根拔掉（实测 vivo 上就是卡在这一步）。
+                //   改用更长的 CONNECTING_TIMEOUT 兜底，超时才放开。
+                sessionActive = true;
+                main.removeCallbacks(reAdvertiseRunnable);
+                scheduleConnectingTimeout();
             } else if (newState == 2 || newState == 3) {
                 // 已连上：撤销任何待执行的重新广播，免得刚连上就被重启广播打断；看门狗也会因此空转。
                 sessionActive = true;
+                cancelConnectingTimeout();
                 main.removeCallbacks(reAdvertiseRunnable);
+            } else if (newState >= 10000) {
+                // 10003 / 10004 / 10008 —— SDK 的 handleConnectFailed() 三个失败分支
+                // （分别对应 USB / P2P / SoftAP 建链失败）。这些不是 0/1/2/3 状态，
+                // 落到这里必须清掉会话标记，否则看门狗会一直以为「正在协商」而永不重播。
+                log("✗ 连接失败码 " + newState + " → 交回看门狗，准备重播");
+                sessionActive = false;
+                castStarted = false;
+                cancelConnectingTimeout();
+                if (newState == 10008) {
+                    // 10008 总是紧跟在 startAdvertise() 之后出现，是「本端刚重启广播，
+                    // 上一个会话因此作废」的回声，不是手机侧的新失败。再触发一次重播
+                    // 只会制造 1.2 秒级的自我循环（日志里 10003→重播→10008→重播）。
+                    log("  （10008 为重播回声，跳过再次重播）");
+                    scheduleAutoRefresh();
+                } else {
+                    scheduleReAdvertise();
+                    scheduleAutoRefresh();
+                }
             }
-            // newState == 1（CONNECTING）刻意不置 sessionActive：若协商卡死超过一个刷新周期，
-            // 看门狗需要能重播把它救回来。正常协商只需数秒，30 秒的余量足够。
             final int st = newState;
             main.post(() -> listener.onConnectionState(st));
         }
@@ -351,6 +480,7 @@ public class IccoaManager {
         @Override
         public void onConnectingProgress(String phoneId, int progress) {
             log("onConnectingProgress " + progress);
+            main.post(() -> listener.onProgress(progress));
         }
 
         @Override
@@ -368,18 +498,27 @@ public class IccoaManager {
             UCarCommon.WorkMode chosen;
             if (supported == null) {
                 chosen = UCarCommon.WorkMode.NONE;
-            } else if (supported.isSupportAppWindowCast()) {
-                chosen = UCarCommon.WorkMode.APP_WINDOW_CAST;
+            } else if (supported.isSupportNormalCast()) {
+                // ★ 必须优先 NormalCast（全屏镜像）。
+                //
+                //   原实现优先选 AppWindow / AppFullScreen，但 buildConfig() 里我们只声明了
+                //   setSupportNormalCast(true)，后两者都是 false。supported 是**手机报告的能力**，
+                //   只要手机支持应用窗口投屏就会选中 APP_WINDOW_CAST —— 车机却按全屏准备。
+                //   后果正是「画面能出、能更新，但触摸坐标按全屏算，点哪都不中」。
+                chosen = UCarCommon.WorkMode.NORMAL_CAST;
             } else if (supported.isSupportAppFullScreenCast()) {
                 chosen = UCarCommon.WorkMode.APP_FULLSCREEN_CAST;
-            } else if (supported.isSupportNormalCast()) {
-                chosen = UCarCommon.WorkMode.NORMAL_CAST;
+            } else if (supported.isSupportAppWindowCast()) {
+                chosen = UCarCommon.WorkMode.APP_WINDOW_CAST;
             } else if (supported.isSupportDataTransfer()) {
                 chosen = UCarCommon.WorkMode.DATA_TRANSFER;
             } else {
                 chosen = UCarCommon.WorkMode.NONE;
             }
-            log("onSelectWorkMode → " + chosen);
+            log("onSelectWorkMode → " + chosen
+                    + "（手机支持: normal=" + supported.isSupportNormalCast()
+                    + " fullscreen=" + supported.isSupportAppFullScreenCast()
+                    + " window=" + supported.isSupportAppWindowCast() + "）");
             return chosen;
         }
     };
@@ -423,9 +562,14 @@ public class IccoaManager {
         }
         android.util.DisplayMetrics dm = appCtx.getResources().getDisplayMetrics();
         int densityDpi = dm.densityDpi;
-        int dpi = clamp(320, 120, 640);
+        // ★ dpi 不再写死 320。12.8" / 1920x990 的密度约 172dpi，写死 320 会让手机端
+        //   按 320dpi 布局，车机上元素明显偏小。改成跟随面板真实密度。
         int realDpi = clamp(densityDpi, 120, 640);
-        int fps = clamp(60, 15, 60);
+        int dpi = realDpi;
+        // ★ fps 不再硬编码。跟随设置里的 FPS Limit（键名 fps-limit），默认 60 与原行为一致；
+        //   骁龙 665 这类平台上 1080p60 编码余量不足，用户可以在设置里降到 30，
+        //   不需要为此单独编译一版。
+        int fps = clamp(readIntSetting("fps-limit", 60), 15, 60);
         int sw = Math.max(1, screenW), sh = Math.max(1, screenH);
         int vw = Math.max(1, videoW), vh = Math.max(1, videoH);
 
@@ -434,6 +578,27 @@ public class IccoaManager {
                 .setSupportAppFullScreenCast(false)
                 .setSupportAppWindowCast(false)
                 .build();
+
+        // ★ 通道能力只能声明一种，否则 SDK 会按「手机期望值」二选一，且失败后没有回退。
+        //   反编译 ShareLinkService.createWifiConnection(expectConnectType)：
+        //     手机期望 AP(1002) + 车机声明 both(1003) → 关 P2P，createSoftAp
+        //     手机期望 P2P(1001) + 车机声明 both(1003) → 关 AP，createGroupForClient
+        //     手机期望值与车机能力对不上（无对应分支）→
+        //        notifyConnectFailed(3) → 对外 10003，日志 "the phone don't support wireless connection"
+        //   原先两个都写 true，等于把选择权交给手机；一旦选中的那条路在本机不可用，
+        //   就停在 progress 10 等 15 秒，然后 10003。
+        //   这里改为跟随设置里的 Network transport：
+        //     0 = WiFi Direct → 只声明 P2P
+        //     1 = Hotspot     → 只声明 SoftAP（需系统热点处于开启状态）
+        boolean useP2p = true, useAp = true;
+        try {
+            int transport = readIntSetting("native-ap-transport", 1);
+            useP2p = (transport == 0);
+            useAp = !useP2p;
+            log("通道能力: transport=" + transport + " → P2P=" + useP2p + " SoftAP=" + useAp);
+        } catch (Throwable t) {
+            log("读取 transport 失败，退回 both: " + t);
+        }
 
         return new UCarConfig.Builder()
                 .setCarBrMac(carId)                  // 必须恰好 6 字节
@@ -444,8 +609,8 @@ public class IccoaManager {
                 .setScreenHeight(sh)
                 .setVideoDisplayWidth(vw)
                 .setVideoDisplayHeight(vh)
-                .setSupportP2P(true)
-                .setSupportSoftAP(true)
+                .setSupportP2P(useP2p)
+                .setSupportSoftAP(useAp)
                 .setSupportCamera(false)
                 .setSupportHevc(false)
                 .setSupportMic(true)
@@ -462,6 +627,19 @@ public class IccoaManager {
         return v < lo ? lo : (v > hi ? hi : v);
     }
 
+    /**
+     * 读取设置项，读不到就用默认值。
+     * ICCOA 与设置页共享同一份 SharedPreferences（名称为 "settings"），
+     * 这样网络通道、帧率等参数都能由用户在界面上调整，不必为此单独编译。
+     */
+    private int readIntSetting(String key, int def) {
+        try {
+            return appCtx.getSharedPreferences("settings", Context.MODE_PRIVATE).getInt(key, def);
+        } catch (Throwable t) {
+            return def;
+        }
+    }
+
     private byte[] generateCarId() {
         SharedPreferences prefs = appCtx.getSharedPreferences("car_id_prefs", Context.MODE_PRIVATE);
         String saved = prefs.getString("car_id_key", "");
@@ -474,13 +652,33 @@ public class IccoaManager {
                 log("carId 缓存解码失败: " + t);
             }
         }
-        byte[] raw = getBluetoothMac();
+        // ★ 不再用 BluetoothAdapter.getAddress()。Android 6 起非系统应用拿到的永远是
+        //   02:00:00:00:00:00，而它「长度合法」，于是被当成 carId 存进缓存 —— 结果每台
+        //   车机广播同一个标识，手机端 Peer 表也会互相撞车。改用 ANDROID_ID 派生。
+        byte[] raw = deriveCarIdFromAndroidId();
         if (raw == null || raw.length != 6) {
             raw = new byte[6];
             new Random().nextBytes(raw);
         }
         prefs.edit().putString("car_id_key", Base64.encodeToString(raw, Base64.NO_WRAP)).apply();
         return raw;
+    }
+
+    /** 从 ANDROID_ID 稳定派 6 字节 carId；取不到返回 null，由调用方退回随机。 */
+    private byte[] deriveCarIdFromAndroidId() {
+        try {
+            String id = android.provider.Settings.Secure.getString(
+                    appCtx.getContentResolver(), android.provider.Settings.Secure.ANDROID_ID);
+            if (id == null || id.isEmpty() || "9774d56d682e549c".equals(id)) return null;
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(id.getBytes("UTF-8"));
+            byte[] out = new byte[6];
+            System.arraycopy(digest, 0, out, 0, 6);
+            return out;
+        } catch (Throwable t) {
+            log("ANDROID_ID 派生 carId 失败: " + t);
+            return null;
+        }
     }
 
     @android.annotation.SuppressLint("MissingPermission")
@@ -505,6 +703,86 @@ public class IccoaManager {
         return macBytes;
     }
 
+    // ==================================================================
+    // 触控回传（UIBC）
+    // ==================================================================
+
+    /**
+     * 把车机屏幕上的触摸事件回传给手机。
+     *
+     * <p>SDK 的方法签名是 {@code sendTouchEvent(action, count, trackIds[], xs[], ys[])}，
+     * 内部会把坐标从「display 尺寸」（即 {@code setScreenWidth/Height} 传进来的值）映射到
+     * 「source 尺寸」（手机屏幕），再组 JSON、加密、交给 {@code SinkNative.onUibcEvent()}。
+     *
+     * <p>三个前置条件是 SDK 自己检查的，不满足时只打日志并返回 false：
+     * <ul>
+     *   <li>{@code mIsEncryptionSettled} —— 加密尚未就绪（连接未完成）</li>
+     *   <li>{@code mSourceWidth/Height > 0} —— 源尺寸还没初始化</li>
+     *   <li>三个数组长度必须都等于 {@code count}</li>
+     * </ul>
+     *
+     * @param e     车机侧的触摸事件
+     * @param viewW 承载画面的 View 宽度（像素）
+     * @param viewH 承载画面的 View 高度（像素）
+     */
+    public void sendTouch(android.view.MotionEvent e, int viewW, int viewH) {
+        if (adapter == null || e == null) return;
+        if (viewW <= 0 || viewH <= 0) return;
+
+        final int action = e.getActionMasked();
+        // ★ 节流。车机触摸面板采样率通常 100~120Hz，逐事件转发会把 UIBC 通道塞满
+        //   （每帧 MOVE 都要组 JSON + 加密 + 走 RTP），在 2.4GHz 链路上反而把延迟推高。
+        //   把 MOVE 压到约 60Hz，DOWN / UP / CANCEL 一律不节流，保证点击手感。
+        final long now = android.os.SystemClock.uptimeMillis();
+        if (action == android.view.MotionEvent.ACTION_MOVE && now - lastTouchSentMs < 16L) {
+            return;
+        }
+        lastTouchSentMs = now;
+
+        final int count = e.getPointerCount();
+        final int[] ids = new int[count];
+        final int[] xs = new int[count];
+        final int[] ys = new int[count];
+        for (int i = 0; i < count; i++) {
+            ids[i] = e.getPointerId(i);
+            // ★ 归一化到「投屏内容」的坐标系（videoW x videoH），不是面板坐标系。
+            //   UIBC 的坐标基准是镜像画面的尺寸：SDK 内部按 displayWidth → sourceWidth 映射，
+            //   而 displayWidth 对应的是视频画布。之前用 screenW(2800) 传，视频只有 1280 宽，
+            //   映射后坐标全部越界，手机收到也落不到任何控件上 —— 表现就是「点了等于没点」。
+            xs[i] = Math.round(e.getX(i) * videoW / (float) viewW);
+            ys[i] = Math.round(e.getY(i) * videoH / (float) viewH);
+            // 钳制到画面内。车机触摸屏的边缘值可能略超出 View 范围（面板黑边、
+            // 系统手势区），越界坐标会被对端当成非法事件丢弃。
+            xs[i] = Math.max(0, Math.min(videoW - 1, xs[i]));
+            ys[i] = Math.max(0, Math.min(videoH - 1, ys[i]));
+        }
+        try {
+            boolean ok = adapter.sendTouchEvent(action, count, ids, xs, ys);
+            // ★ 成功也要记一条。之前只在失败时打日志，结果「触摸没反应」时无从判断
+            //   到底是事件没到、还是到了但被 SDK 拒、还是送到了手机但手机没执行。
+            //   预算 12 条足够看清一次按下-移动-抬起，又不会把诊断报告冲掉。
+            if (touchLogBudget > 0) {
+                touchLogBudget--;
+                log("触控回传 action=" + action + " count=" + count
+                        + " view=" + viewW + "x" + viewH
+                        + " video=" + videoW + "x" + videoH
+                        + " p0=(" + xs[0] + "," + ys[0] + ")"
+                        + " → " + (ok ? "已发送" : "被拒"));
+            }
+        } catch (Throwable t) {
+            if (touchLogBudget > 0) {
+                touchLogBudget--;
+                log("sendTouchEvent 异常: " + t);
+            }
+        }
+    }
+
+    /** 触控失败日志的预算：避免每帧 MOVE 都刷屏把诊断报告冲掉。 */
+    private int touchLogBudget = 12;
+
+    /** 上一次转发 MOVE 的时刻，用于把触摸频率压到约 60Hz。 */
+    private long lastTouchSentMs = 0L;
+
     private void log(String msg) {
         Log.i(TAG, msg);
         try { listener.onLog(msg); } catch (Throwable ignored) { }
@@ -514,8 +792,13 @@ public class IccoaManager {
         try { r.run(); } catch (Throwable t) { log("!!! " + where + " 异常: " + t); }
     }
 
-    private static String stateName(int s) {
-        switch (s) {
+    /** deviceID 往往很长，日志里只留前 8 位，够用来区分不同手机。 */
+    private static String shortId(String id) {
+        if (id == null || id.isEmpty()) return "?";
+        return id.length() <= 8 ? id : id.substring(0, 8);
+    }
+
+    private static String stateName(int s) {        switch (s) {
             case 0: return "DISCONNECTED";
             case 1: return "CONNECTING";
             case 2: return "CONNECTED";

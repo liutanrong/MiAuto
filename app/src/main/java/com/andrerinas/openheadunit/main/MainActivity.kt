@@ -302,11 +302,22 @@ class MainActivity : BaseActivity() {
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 App.provide(this@MainActivity).icocaBridge.state.collect { icocaState ->
-                    if (icocaState.phase == IcocaBridge.Phase.Connected) {
+                    // ★ 提前打开投屏页。
+                    //   ICCOA 的 RTSP 协商需要 sink 端（libovmsink.so）已经拿到 Surface，
+                    //   而 Surface 只在 IcocaProjectionActivity 里存在。如果等到
+                    //   phase == Connected 才打开，就会死锁：
+                    //   SDK 停在 80% 等 Surface → 永远不 Connected → 投影页永远不开。
+                    //   50% 是「已确定要投、还没进入媒体协商」的位置，此时建 Surface 正好。
+                    val shouldOpen = icocaState.phase == IcocaBridge.Phase.Connected ||
+                        icocaState.progress >= 50
+                    if (shouldOpen) {
                         // Open once per session: without the flag, coming back from the projection
                         // screen would bounce the user straight back into it, with no way out.
                         if (!icocaProjectionOpened && !IcocaProjectionActivity.isForeground) {
-                            AppLog.i("ICCOA: phone connected — opening projection")
+                            AppLog.i(
+                                "ICCOA: opening projection early " +
+                                    "(phase=${icocaState.phase}, progress=${icocaState.progress})"
+                            )
                             icocaProjectionOpened = true
                             startActivity(IcocaProjectionActivity.intent(this@MainActivity))
                         }

@@ -22,6 +22,12 @@
     <uses-feature
         android:name="android.hardware.usb.host"
         android:required="false" />
+    <!-- ICCOA 的 AOA 通道要用 accessory 角色。SDK 在 AOAConnectManager.init() 里动态注册
+         AOAAccessoryReceiver 监听 USB_ACCESSORY_ATTACHED，但系统要求应用先在清单里声明
+         支持 accessory，否则这条广播可能根本不会派发（部分 ROM 严格实现）。 -->
+    <uses-feature
+        android:name="android.hardware.usb.accessory"
+        android:required="false" />
     <uses-feature
         android:name="android.hardware.screen.landscape"
         android:required="false" />

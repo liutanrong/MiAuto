@@ -46,6 +46,14 @@ class IcocaBridge(context: Context) : IccoaManager.Listener {
         val carDeviceName: String? = null,
         /** Last raw SDK log line, kept for the diagnostics screen. */
         val lastLog: String? = null,
+        /**
+         * Connection progress 0..100, straight from the SDK.
+         *
+         * The projection activity has to exist before the SDK finishes its RTSP negotiation —
+         * it owns the Surface the sink draws into. Waiting for [Phase.Connected] is a deadlock:
+         * the SDK stalls at 80% because there is no Surface, so it never reports Connected.
+         */
+        val progress: Int = 0,
     )
 
     private val _state = MutableStateFlow(State())
@@ -112,6 +120,15 @@ class IcocaBridge(context: Context) : IccoaManager.Listener {
     fun setScreenSize(width: Int, height: Int) = manager.setScreenSize(width, height)
 
     /**
+     * Forwards a touch on the car screen back to the phone (UIBC).
+     *
+     * The SDK maps our display coordinate space onto the phone's own screen, so the values we
+     * pass must be expressed in the panel coordinate system the view occupies.
+     */
+    fun sendTouch(event: android.view.MotionEvent, viewWidth: Int, viewHeight: Int) =
+        manager.sendTouch(event, viewWidth, viewHeight)
+
+    /**
      * Hands the projection [surface] to the SDK. Idempotent: the SDK ignores a repeated call for
      * an already-casting surface, and [IccoaManager] only starts the cast once.
      */
@@ -130,14 +147,20 @@ class IcocaBridge(context: Context) : IccoaManager.Listener {
     }
 
     override fun onConnectionState(stateCode: Int) {
+        // ★ 只处理有明确含义的码，其余保持当前状态不变。
+        //
+        //   SDK 在 CONNECTED(3) 之后还会继续回调 -1（日志里是 "CONNECTED -> STATE_-1"
+        //   紧跟在 progress 100 后面），那是状态机切换的过渡值，不是断开。原实现把所有
+        //   未知码一律映射成 Advertising，结果画面已经投出来了，投屏页上还挂着
+        //   「正在连接手机」，而且 phase 一变，MainActivity 的打开标志也被重置。
         val phase = when (stateCode) {
             0 -> Phase.Advertising
             1, 2 -> Phase.Pairing
             3 -> Phase.Connected
-            else -> Phase.Advertising
+            else -> null
         }
-        AppLog.i("ICCOA: connection state $stateCode -> $phase")
-        updatePhase(phase)
+        AppLog.i("ICCOA: connection state $stateCode -> ${phase ?: "(keeping current)"}")
+        if (phase != null) updatePhase(phase)
     }
 
     override fun onPinCode(pinCode: String?, carDeviceName: String?) {
@@ -150,6 +173,11 @@ class IcocaBridge(context: Context) : IccoaManager.Listener {
     override fun onCastStarted() {
         AppLog.i("ICCOA: cast started")
         updatePhase(Phase.Connected)
+    }
+
+    override fun onProgress(progress: Int) {
+        AppLog.i("ICCOA: progress $progress")
+        _state.update { it.copy(progress = progress) }
     }
 
     override fun onNavigation(info: UCarCommon.NavigationInfo?) {
