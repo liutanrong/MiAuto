@@ -865,6 +865,9 @@ class SettingsFragment : Fragment() {
                 selectedIndex = (pendingNativeApTransport ?: 0).takeIf { it in 0..1 } ?: 0,
                 onOptionSelected = { index ->
                     pendingNativeApTransport = index
+                    // ★ 立即落盘：这一项决定 ICCOA 声明 P2P 还是 SoftAP，属于「改完就要生效」
+                    //   的开关。留在 pending 里等用户点底部保存，很容易被当成「切不动」。
+                    settings.nativeApTransport = index
                     checkChanges()
                     updateSettingsList()
                 }

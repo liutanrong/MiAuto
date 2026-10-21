@@ -79,7 +79,18 @@ class ConnectionSetupFragment : Fragment() {
                 } else LinearLayout.LayoutParams(-1, -2))
                 val selected = if (pendingCarHotspotSetup) mode == 1 else settings.wifiConnectionMode == 3 && settings.nativeApTransport == mode
                 button(option, if (selected) "✓  $title" else title, selected) {
-                    if (mode == 1) { pendingCarHotspotSetup = true; render() } else selectMode(mode)
+                    if (mode == 1) {
+                        // ★ 原来这里只置 pendingCarHotspotSetup，要再点一次「Save and use hotspot」
+                        //   才写盘；而 WiFi Direct 那一支是立即写。两边不对称，用户点完看到 ✓
+                        //   就返回，实际什么都没保存 —— 以前无所谓（ICCOA 不读这个值），
+                        //   现在 ICCOA 按它决定声明 P2P 还是 SoftAP，必须立即生效。
+                        pendingCarHotspotSetup = true
+                        settings.nativeApTransport = 1
+                        settings.wifiConnectionMode = 3
+                        render()
+                    } else {
+                        selectMode(mode)
+                    }
                 }
                 text(option, hint, 16)
             }
