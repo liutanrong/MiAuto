@@ -59,6 +59,8 @@ public class IccoaManager {
 
     private UCarAdapter adapter = null;
     private Surface surface = null;
+    /** 上一次真正用于 startCast 的 Surface 尺寸，用于区分「同一个 Surface 的重复回调」与「尺寸变化」。 */
+    private int surfaceW = -1, surfaceH = -1;
 
     /** {@link #tryStartCast()} 的重试预算（×500ms = 最长 10 秒）。 */
     private static final int CAST_RETRY_MAX = 20;
@@ -68,6 +70,8 @@ public class IccoaManager {
     private volatile boolean sdkInitialized = false;
     private volatile boolean sdkReady = false;
     private volatile boolean castStarted = false;
+    /** 上一次 init() 时实际采用的通道（native-ap-transport 的值），用于检测配置变更。 */
+    private int appliedTransport = Integer.MIN_VALUE;
     private volatile String lastPinCode = null;
 
     /** 会话结束后重新广播的延时：留出 SDK 内部收尾时间，避免与断连流程竞争。 */
@@ -214,18 +218,34 @@ public class IccoaManager {
     public String getLastPinCode() { return lastPinCode; }
 
     /** Surface 就绪 / 变化（Activity 的 surfaceChanged 回调里调用）。 */
-    public void setSurface(Surface s) {
-        // 同一个 Surface 的重复回调（surfaceChanged 会再次进来）直接忽略：
-        // SDK 自己会处理尺寸变化，这里再 startCast 一次只会打断正在进行的媒体协商。
-        if (s != null && s == this.surface) return;
+    public void setSurface(Surface s, int w, int h) {
+        if (s == null) return;
+
+        // ★ 只有「同一个 Surface + 尺寸没变 + 已经在投」才算重复回调。
+        //   原来的判断是 `s == this.surface` 就直接 return —— 但 surfaceCreated 与
+        //   surfaceChanged 传进来的是同一个 Surface 对象，而 surfaceCreated 那一刻
+        //   尺寸往往还是 0（日志里 surfaceChanged 1920x1080 要晚 2ms 才到）。
+        //   结果 sink 被绑在一个尺寸未知的 Surface 上，首帧出不来：界面连上了、进度到
+        //   100、startCast 也返回 true，但就是黑屏；退出重连时 Activity 已存在，Surface
+        //   创建时就带正确尺寸，所以第二次正常。
+        final boolean sameSurface = (s == this.surface);
+        final boolean sameSize = (w == surfaceW && h == surfaceH);
+        if (sameSurface && sameSize && castStarted) return;
+
         this.surface = s;
+        this.surfaceW = w;
+        this.surfaceH = h;
         castRetry = 0;          // 新 Surface 到位，重试预算重置
-        // ★ Surface 重建（旋转屏、切后台再回来、Activity 重建）后必须允许重新投。
-        //   原实现只重置重试预算，但 tryStartCast() 首行就是 "castStarted 则 return"，
-        //   而 castStarted 仍为 true —— 新 Surface 永远拿不到流，表现为永久黑屏。
+
         if (castStarted) {
-            log("Surface 重建 → 重置 castStarted，重新 startCast");
+            log("Surface 变化（" + w + "x" + h + "）→ 重置 castStarted，重新 startCast");
             castStarted = false;
+        }
+
+        // 尺寸还没确定时不启动：等 surfaceChanged 带着真实尺寸再进来。
+        if (w <= 0 || h <= 0) {
+            log("Surface 尺寸未就绪（" + w + "x" + h + "），等 surfaceChanged");
+            return;
         }
         tryStartCast();
     }
@@ -240,11 +260,41 @@ public class IccoaManager {
         // 每次开始新会话都重置触控日志预算，否则第一次调试用完 12 条之后，
         // 后续连接里的触摸将完全不留痕迹（曾经因此误判为「事件没到」）。
         touchLogBudget = 12;
-        if (sdkInitialized && adapter != null) {
+
+        // ★ UCarConfig 只在 init() 时生效一次，而 start() 在「已初始化」时会直接返回。
+        //   于是用户改了 Network transport 之后，界面上变了、报告头也变了，但实际会话
+        //   仍在用旧配置（典型症状：报告头写 transport=0，而"通道能力"那行还是 1）。
+        //   这里比对当前设置与已生效的值，不一致就停掉旧会话并重建。
+        final int currentTransport = readIntSetting("native-ap-transport", 1);
+        final boolean transportChanged =
+                (appliedTransport != Integer.MIN_VALUE && currentTransport != appliedTransport);
+
+        if (sdkInitialized && adapter != null && !transportChanged) {
             log("重启：SDK 已初始化，仅重新广播");
             reAdvertise();
             return;
         }
+
+        if (sdkInitialized && transportChanged) {
+            log("通道配置 " + appliedTransport + " → " + currentTransport + "，重建 SDK");
+            try {
+                adapter.stopAdvertise();
+            } catch (Throwable t) {
+                log("stopAdvertise 异常: " + t);
+            }
+            try {
+                adapter.disconnect();
+            } catch (Throwable t) {
+                log("disconnect 异常: " + t);
+            }
+            sdkInitialized = false;
+            sdkReady = false;
+            castStarted = false;
+            sessionActive = false;
+            main.removeCallbacks(autoRefreshRunnable);
+            main.removeCallbacks(reAdvertiseRunnable);
+        }
+
         UCarConfig config;
         try {
             config = buildConfig();
@@ -252,13 +302,17 @@ public class IccoaManager {
             log("✗ 配置构造失败: " + t);
             return;
         }
-        try {
-            adapter = UCarAdapter.getInstance();
-            adapter.registerCarConnectListener(connectListener);
-            adapter.registerPhoneDataListener(phoneDataListener);
-        } catch (Throwable t) {
-            log("✗ getInstance/register 异常: " + t);
-            return;
+        appliedTransport = currentTransport;
+
+        if (adapter == null) {
+            try {
+                adapter = UCarAdapter.getInstance();
+                adapter.registerCarConnectListener(connectListener);
+                adapter.registerPhoneDataListener(phoneDataListener);
+            } catch (Throwable t) {
+                log("✗ getInstance/register 异常: " + t);
+                return;
+            }
         }
         initSdk(config);
     }
@@ -292,6 +346,11 @@ public class IccoaManager {
             public void onInitFailed(int errCode) {
                 log("✗ onInitFailed(" + errCode + ")"
                         + (errCode == 10001 ? " ← HandlerThread 启动失败" : ""));
+                // SDK 是单例，重复 init() 未必被允许。切换通道后若走到这里，
+                // 说明重建没成功，只能靠冷启动。
+                if (appliedTransport != Integer.MIN_VALUE) {
+                    log("→ 若刚切换过通道，请完全退出 App（最近任务划掉）后重开");
+                }
             }
         });
         if (!posted) log("✗ init() 返回 false —— 任务未提交");

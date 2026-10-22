@@ -132,7 +132,8 @@ class IcocaBridge(context: Context) : IccoaManager.Listener {
      * Hands the projection [surface] to the SDK. Idempotent: the SDK ignores a repeated call for
      * an already-casting surface, and [IccoaManager] only starts the cast once.
      */
-    fun setSurface(surface: Surface) = manager.setSurface(surface)
+    fun setSurface(surface: Surface, width: Int, height: Int) =
+        manager.setSurface(surface, width, height)
 
     /** Last PIN the SDK issued, or null. Useful when the projection activity opens late. */
     fun lastPinCode(): String? = manager.lastPinCode

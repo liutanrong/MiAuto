@@ -57,14 +57,15 @@ class IcocaProjectionActivity : AppCompatActivity() {
             object : SurfaceHolder.Callback {
                 override fun surfaceCreated(holder: SurfaceHolder) {
                     AppLog.i("ICCOA projection: surfaceCreated")
-                    bridge.setSurface(holder.surface)
+                    // 此刻宽高还没确定（实测 surfaceChanged 要晚约 2 ms 才到），
+                    // 传 0 让 IccoaManager 等到真实尺寸再启动投屏。
+                    bridge.setSurface(holder.surface, 0, 0)
                 }
 
                 override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
                     AppLog.i("ICCOA projection: surfaceChanged ${width}x$height")
-                    // Re-bind on every change: a size change tears the surface down underneath the
-                    // SDK, and the stale reference would otherwise keep receiving frames.
-                    bridge.setSurface(holder.surface)
+                    // 尺寸变化会让 SDK 底下的 Surface 失效，必须用新尺寸重新 startCast。
+                    bridge.setSurface(holder.surface, width, height)
                 }
 
                 override fun surfaceDestroyed(holder: SurfaceHolder) {
