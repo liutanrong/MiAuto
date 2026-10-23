@@ -338,7 +338,12 @@ class MainActivity : BaseActivity() {
                     //   所以提前打开没有保留价值，恢复成 progress >= 10 才进投屏页。
                     val shouldOpen = icocaState.phase == IcocaBridge.Phase.Connected ||
                         icocaState.progress >= 10
-                    if (shouldOpen) {
+                    // ★ 只有本页真的在最上层时才自动跳。
+                    //   设置页是独立的 Activity：用户在「设置 → 网络通道」里改选项时手机
+                    //   恰好连上，原来的写法会直接把投屏页盖上来，把人从设置里踢出去。
+                    //   被别的 Activity 覆盖时 MainActivity 只到 STARTED，用它做闸门最省事。
+                    val onTop = lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+                    if (shouldOpen && onTop) {
                         // Open once per session: without the flag, coming back from the projection
                         // screen would bounce the user straight back into it, with no way out.
                         if (!icocaProjectionOpened && !IcocaProjectionActivity.isForeground) {

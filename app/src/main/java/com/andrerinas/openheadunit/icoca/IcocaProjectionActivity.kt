@@ -113,8 +113,19 @@ class IcocaProjectionActivity : AppCompatActivity() {
                     //   startCast 不会每次都重发，于是 onCastStarted 也不会再触发 ——
                     //   旧写法（phase == Connected 才隐藏）就会把提示永久留在画面上，
                     //   也就是"已经连上了还显示正在连接"。
+                    // 每次连接进度变化都续一次采样窗：手机连得慢时不至于把预算耗光。
+                    if (!state.castReady && state.progress != probeProgress) {
+                        probeProgress = state.progress
+                        if (!probeVisible) startPixelProbe()
+                    }
+
                     if (state.castReady) {
                         stopPixelProbe()
+                        // 首帧确认后把当前日夜模式同步给手机（只同步一次，避免每帧都发）。
+                        if (!dayNightSynced) {
+                            dayNightSynced = true
+                            bridge.sendDayNight(isNightMode())
+                        }
                         // 首帧到了 → 遮罩淡出。180ms 的淡出比直接 GONE 更稳：
                         // 解码第一帧与实际送显之间有一两帧的差，硬切会闪一下黑。
                         if (veil.visibility == View.VISIBLE) {
@@ -140,6 +151,28 @@ class IcocaProjectionActivity : AppCompatActivity() {
         }
     }
 
+    // ★ 方控：把面板/方向盘按键透传给手机。
+    //   返回 true 表示已由 ICCOA 处理，不再交给本地控件；返回 false 说明这个键
+    //   没有对应语义（比如音量）或者当前没在投屏，继续走原生分发。
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+        if (bridge.handleKey(event)) {
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    // 车机切换深色/浅色时同步给手机，手机端界面跟着变，夜间不刺眼。
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (dayNightSynced) {
+            bridge.sendDayNight(isNightMode())
+        }
+    }
+
+    private fun isNightMode(): Boolean =
+        (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
+
     override fun onStart() {
         super.onStart()
         isForeground = true
@@ -158,14 +191,22 @@ class IcocaProjectionActivity : AppCompatActivity() {
     // 任一条件不满足，画面已经在放、回调却永远不来 —— 上层就会认定黑屏，进而白白
     // 断掉一个本来正常的会话。像素采样是唯一不依赖 SDK 内部状态的判据。
     private val probeHandler = android.os.Handler(android.os.Looper.getMainLooper())
-    private var probeRuns = 0
     private var probeVisible = false
+    /** 采样窗口的截止时刻（elapsedRealtime）。窗口用「时间」而不是「次数」来限。 */
+    private var probeDeadline = 0L
+    /** 上一次触发采样时的进度，用来在每次进度变化时续命。 */
+    private var probeProgress = -1
+    /** 是否已经把日夜模式同步给手机（首帧之后做一次即可）。 */
+    private var dayNightSynced = false
 
     private val probeRunnable = object : Runnable {
         override fun run() {
             val sv = findViewById<SurfaceView>(R.id.icoca_surface) ?: return
-            if (probeVisible || probeRuns >= MAX_PROBE_RUNS) return
-            probeRuns++
+            if (probeVisible) return
+            // ★ 以前这里是「采满 40 次就停」，而 40 次只有 10 秒 —— 手机连得慢一点，
+            //   采样预算在画面出现之前就用完，遮罩再也撤不掉，看起来就是彻底黑屏。
+            //   现在改成时间窗，并且每收到一次进度回调就续命，等多久就采多久。
+            if (android.os.SystemClock.elapsedRealtime() > probeDeadline) return
             sampleOnce(sv)
             probeHandler.postDelayed(this, PROBE_INTERVAL_MS)
         }
@@ -173,8 +214,8 @@ class IcocaProjectionActivity : AppCompatActivity() {
 
     private fun startPixelProbe() {
         if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.N) return
-        probeRuns = 0
         probeVisible = false
+        probeDeadline = android.os.SystemClock.elapsedRealtime() + PROBE_WINDOW_MS
         probeHandler.removeCallbacks(probeRunnable)
         // 首个 buffer 不可能瞬间出来，先等一拍再采，省掉几次必然全黑的拷贝。
         probeHandler.postDelayed(probeRunnable, 400L)
@@ -327,9 +368,11 @@ class IcocaProjectionActivity : AppCompatActivity() {
     companion object {
         /** 像素采样周期。250ms 足够快，又不会干扰渲染线程。 */
         private const val PROBE_INTERVAL_MS = 250L
-        /** 最多采 120 次（约 30 秒）。投屏页现在从广播时就开始等，手机关联要 7 秒左右，
-         *  40 次（10 秒）会在画面出现前就用完预算，遮罩反而撤不掉。 */
-        private const val MAX_PROBE_RUNS = 120
+        /**
+         * 采样时间窗。每次收到「连接进度变化」都会重新计时，所以它实际表示
+         * 「最后一次进度变化之后还愿意等多久」。
+         */
+        private const val PROBE_WINDOW_MS = 60_000L
 
         /** Read by MainActivity to avoid stacking a second projection instance. */
         @Volatile

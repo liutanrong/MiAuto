@@ -1,7 +1,12 @@
 package com.miauto.app;
 
+import android.Manifest;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.location.Location;
+import android.location.LocationManager;
+import android.view.KeyEvent;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Base64;
@@ -79,6 +84,17 @@ public class IccoaManager {
         void onRecovering();
         /** 手机导航信息（POC-2 / BYD 仪表与 HUD 的数据源）。 */
         void onNavigation(UCarCommon.NavigationInfo info);
+
+        /**
+         * 手机端媒体信息（曲目 / 播放状态）。
+         *
+         * <p>默认空实现：这两个回调只是把 SDK 已经送来的数据往上抛一层，
+         * 没接住也不该影响投屏本身。
+         */
+        default void onMusicInfo(String text) { }
+
+        /** 手机端电话状态（空闲 / 来电 / 通话中）。默认空实现，理由同上。 */
+        default void onCallState(String text) { }
     }
 
     private final Context appCtx;
@@ -120,11 +136,15 @@ public class IccoaManager {
     private boolean firstFrameFromStart = false;
     /** 最近一次收到的协商进度，用于在 startCast 日志里确认「是否早于媒体协商」。 */
     private volatile int lastProgress = 0;
-    /** 预热用的离屏 Surface（2x2）+ 它的 ImageReader，保持引用防止被回收。 */
-    private android.media.ImageReader prewarmReader = null;
-    private Surface prewarmSurface = null;
-    /** 是否已经预热过；只在进程生命周期内做一次。 */
-    private boolean decoderPrewarmed = false;
+    /** 会话统计（首帧耗时、重连次数、通道、手机型号），汇总与诊断报告共用。 */
+    private final IccoaSessionStats stats = new IccoaSessionStats();
+    /** 触控映射与节流。 */
+    private final IccoaTouch touch = new IccoaTouch();
+    /** P2 车联能力开关（方控 / 日夜 / 车况），启动时读一次。 */
+    private boolean carLinkEnabled = true;
+    private boolean gpsUplinkEnabled = true;
+    /** 音乐信息的日志预算：播放时可能每秒来好几条，刷屏会淹掉投屏本身的记录。 */
+    private int musicLogBudget = 6;
 
     // ---- 「先空配、后交接」：让首场会话也走 setOutputSurface 这条稳的路 ----
     /**
@@ -333,70 +353,6 @@ public class IccoaManager {
 
     public String getLastPinCode() { return lastPinCode; }
 
-    /** Surface 就绪 / 变化（Activity 的 surfaceChanged 回调里调用）。 */
-    /**
-     * Surface 被销毁：倒车影像、系统浮层、Activity 重建都会走到这里。
-     * 必须清空引用与尺寸，否则重建出来的 Surface 若恰好是同一个对象，
-     * setSurface 的去重判断会认为「没变化」，直接跳过重投 —— 表现就是切完倒车回来黑屏。
-     */
-    /**
-     * 预热解码器（进程内只做一次）。
-     *
-     * <p>日志里反复出现的规律：进程启动后的**第一场会话从来不出帧**，断开重连的第二场
-     * 一定正常 —— 而两次唯一的差别是 `VideoPlayerV2.mIsConfigured`：
-     *
-     * <pre>
-     *   第一次 startCast → init() 走 configureDecoder 分支：
-     *       MediaFormat.createVideoFormat(mime, w, h)
-     *       codec.configure(format, surface, ...)
-     *       mIsFirstLaunch = true
-     *       VideoQueueManager.clearDataIfNeeded()   ← 清空已到达的帧
-     *   之后 startCast → init() 只调 codec.setOutputSurface(surface)
-     * </pre>
-     *
-     * 也就是说，只要在**任何会话开始之前**先把解码器 configure 掉，真实会话进来时就只会
-     * 走 setOutputSurface，不会再被那次 clearData 吃掉首个关键帧。
-     *
-     * 这里用一块 2x2 的 ImageReader Surface 做这次"空配置"：没有会话就没有帧，
-     * 解码器只是建好待命；真实 Surface 到位时再 startCast 一次，走的正是 setOutputSurface。
-     * 失败不影响主链路，所有异常都吞掉并记日志。
-     */
-    private void prewarmDecoder() {
-        if (decoderPrewarmed) return;
-        decoderPrewarmed = true;
-        try {
-            if (adapter == null) return;
-            prewarmReader = android.media.ImageReader.newInstance(
-                    2, 2, android.graphics.PixelFormat.RGBA_8888, 2);
-            prewarmReader.setOnImageAvailableListener(reader -> {
-                try {
-                    android.media.Image img = reader.acquireLatestImage();
-                    if (img != null) img.close();
-                } catch (Throwable ignored) {
-                }
-            }, new android.os.Handler(android.os.Looper.getMainLooper()));
-            prewarmSurface = prewarmReader.getSurface();
-            boolean ok = adapter.startCast(prewarmSurface, videoW, videoH, surfaceStateListener);
-            log("预热解码器 startCast(2x2 离屏, 配置 " + videoW + "x" + videoH + ") = " + ok);
-        } catch (Throwable t) {
-            log("预热解码器失败（不影响主链路）: " + t);
-        }
-    }
-
-    /** 释放预热用资源。 */
-    private void releasePrewarm() {
-        try {
-            if (prewarmSurface != null) prewarmSurface.release();
-        } catch (Throwable ignored) {
-        }
-        try {
-            if (prewarmReader != null) prewarmReader.close();
-        } catch (Throwable ignored) {
-        }
-        prewarmSurface = null;
-        prewarmReader = null;
-    }
-
     /** 离屏预热 Surface 交给真实 Surface 之前的缓冲时间：够 configure + start 完成。 */
     private static final long PRIME_HANDOFF_DELAY_MS = 300L;
 
@@ -490,6 +446,16 @@ public class IccoaManager {
                 return;
             }
             int ct = dev.getConnectType();
+            stats.connectType = ct;
+            try {
+                // MobileDevice 只有 getModel / getProductName，没有通用的 getName。
+                String model = dev.getModel();
+                stats.phoneModel = (model == null || model.isEmpty()) ? dev.getProductName() : model;
+                if (stats.phoneModel == null) {
+                    stats.phoneModel = "";
+                }
+            } catch (Throwable ignored) {
+            }
             String name;
             switch (ct) {
                 case 2:  name = "USB（AOA 全通道）"; break;
@@ -527,16 +493,20 @@ public class IccoaManager {
         }
     }
 
-    /** 每次会话结束时打一行汇总，四组实验可以在同一份报告里横向对比。 */
+    /**
+     * 每次会话结束时打一行汇总。
+     *
+     * <p>内容由 {@link IccoaSessionStats#summary()} 统一生成：除了原来就有的分辨率、
+     * 协商耗时、首帧耗时，现在还带上「本进程会话数 / 重连次数 / 实际通道 / 手机型号」——
+     * 以前排查时要人工从几百行日志里数这些，现在一行就够。
+     */
     private void logSessionSummary(String reason) {
-        log("[诊断汇总] " + reason
-                + " | res=" + videoW + "x" + videoH
-                + " fps=" + appliedFps
-                + " 协商90→100=" + (lastSegMs < 0 ? "?" : lastSegMs + "ms")
-                + " 首帧=" + (lastFirstFrameMs < 0
-                        ? "未就绪"
-                        : lastFirstFrameMs + "ms" + (firstFrameFromStart ? "(自startCast)" : ""))
-                + " 结果=" + (surfaceReady ? "正常" : "黑屏"));
+        stats.fps = appliedFps;
+        if (stats.surfaceW <= 0) {
+            stats.surfaceW = videoW;
+            stats.surfaceH = videoH;
+        }
+        log("[诊断汇总] " + reason + " | " + stats.summary());
     }
 
     public void onSurfaceDestroyed() {
@@ -552,6 +522,8 @@ public class IccoaManager {
         //   就一直为 true。此时再空配一次，startCast 会走 setOutputSurface 把画面切到
         //   离屏 Surface 上 —— 等于把一条本来正常的链路黑一下。所以空配只做一次。
         primingPhase = false;
+        cancelEarlyBail();
+        cancelGpsTick();
         main.removeCallbacks(surfaceWatchdog);
         log("Surface 已销毁 → 状态清空");
     }
@@ -590,6 +562,7 @@ public class IccoaManager {
         firstFrameFromStart = (tProgress100 == 0L);
         lastFirstFrameMs = firstFrameFromStart ? (now - tStartCast) : (now - tProgress100);
         main.removeCallbacks(surfaceWatchdog);
+        stats.onFirstFrame();
         log("★ 像素采样确认画面已出 —— 距 startCast " + lastFirstFrameMs + "ms"
                 + "（SDK onSurfaceReady 未到，属已知的判定链缺陷）");
         main.post(listener::onFrameVisible);
@@ -681,7 +654,12 @@ public class IccoaManager {
         log("=== 启动（ICCOA CarWith）===");
         // 每次开始新会话都重置触控日志预算，否则第一次调试用完 12 条之后，
         // 后续连接里的触摸将完全不留痕迹（曾经因此误判为「事件没到」）。
-        touchLogBudget = 12;
+        touch.resetLogBudget();
+        stats.resetForNewSession();
+        musicLogBudget = 6;
+        carLinkEnabled = IccoaPrefs.getBool(appCtx, IccoaPrefs.KEY_CAR_LINK, true);
+        gpsUplinkEnabled = IccoaPrefs.getBool(appCtx, IccoaPrefs.KEY_GPS_UPLINK, true);
+        cancelEarlyBail();
         // 每次新会话重置首屏看门狗：重建次数按「单次连接」计，不能跨会话累计。
         castRebuildCount = 0;
         surfaceReady = false;
@@ -691,7 +669,7 @@ public class IccoaManager {
         //   于是用户改了 Network transport 之后，界面上变了、报告头也变了，但实际会话
         //   仍在用旧配置（典型症状：报告头写 transport=0，而"通道能力"那行还是 1）。
         //   这里比对当前设置与已生效的值，不一致就停掉旧会话并重建。
-        final int currentTransport = readIntSetting("native-ap-transport", 1);
+        final int currentTransport = readIntSetting(IccoaPrefs.KEY_TRANSPORT, 1);
         final boolean transportChanged =
                 (appliedTransport != Integer.MIN_VALUE && currentTransport != appliedTransport);
 
@@ -898,14 +876,6 @@ public class IccoaManager {
         tryStartCast();
     }
 
-    /** 广播之后延时执行的预热。 */
-    private final Runnable prewarmRunnable = new Runnable() {
-        @Override
-        public void run() {
-            prewarmDecoder();
-        }
-    };
-
     /**
      * 配对码看门狗：广播成功后 8 秒还没拿到 onPinCode，就重播一次并留日志。
      * 目的不是修复，而是让"没有配对码"这件事在日志里立刻可见，而不是全靠肉眼。
@@ -1008,6 +978,8 @@ public class IccoaManager {
         primingPhase = false;
         surfaceReady = false;
         tStartCast = System.currentTimeMillis();
+        stats.onCastStart();
+        stats.fps = appliedFps;
         // ★ 用带 IAppSurfaceStateListener 的重载：startCast 返回 true 只代表「调用被接收」，
         //   真正决定有没有画面的是 SDK 后续的 onSurfaceReady()。冷启动第一次连接时，
         //   解码器/native sink 首次初始化较慢，startCast 返回 true 但迟迟不回调
@@ -1021,6 +993,9 @@ public class IccoaManager {
             ok = adapter.startCast(s, videoW, videoH);
         }
         castStarted = ok;
+        if (ok) {
+            startGpsTick();
+        }
         log((ok ? "✓ " : "✗ ") + "startCast(" + videoW + "x" + videoH + ") = " + ok
                 + " surfaceValid=" + s.isValid()
                 + " panel=" + screenW + "x" + screenH
@@ -1125,6 +1100,7 @@ public class IccoaManager {
                 log("✗ " + COLD_START_TIMEOUT_MS + "ms 无像素（本进程首场，手机未推流）"
                         + " → 直接断会话，+" + COLD_START_RE_ADVERTISE_DELAY_MS + "ms 重播");
                 main.post(listener::onRecovering);
+                stats.reconnectCount++;
                 try {
                     disconnectSession();
                 } catch (Throwable t) {
@@ -1165,6 +1141,66 @@ public class IccoaManager {
 
     /** 冷启动首场失败后重新广播的延时。手机上 Jovi InCar 收到广播到重连约 1~2 秒。 */
     private static final long COLD_START_RE_ADVERTISE_DELAY_MS = 800L;
+
+    /**
+     * 冷启动首场「秒断」：确认这一场注定失败之后，多等一秒都是纯浪费。
+     *
+     * <p>依据：五轮日志里，进程启动后的第一场会话从 progress 10 到 90 要 1.7 秒，
+     * 90 之后再等 900ms 才判死 —— 加起来 2.6 秒，而这一场从来不会出画面。
+     * 现在改成「一看到 progress 10（手机已连上）就排一次主动重连」，
+     * 把这段等待直接砍掉。
+     *
+     * <p>关掉它（改 false）就退回 .20 的行为：等 progress 90 + 900ms 再判死。
+     */
+    private static final boolean EARLY_BAIL_ENABLED = true;
+    /** 从 progress 10 到主动断开之间的缓冲。留一点时间让手机把会话建完，否则它可能不认这次连接。 */
+    private static final long EARLY_BAIL_MS = 700L;
+
+    /** 本轮是否已经排过「秒断」，避免 progress 反复回调排多次。 */
+    private boolean earlyBailArmed = false;
+
+    private final Runnable earlyBailRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (surfaceReady || everSurfaceReady || !castStarted) {
+                return;
+            }
+            log("✗ 首场秒断：progress 10 后 " + EARLY_BAIL_MS + "ms 主动重连"
+                    + "（本进程尚未出过画面，这一场手机不会推流）");
+            stats.reconnectCount++;
+            try {
+                disconnectSession();
+            } catch (Throwable t) {
+                log("earlyBail disconnect 异常: " + t);
+            }
+            scheduleReAdvertise(COLD_START_RE_ADVERTISE_DELAY_MS);
+        }
+    };
+
+    /**
+     * 是否挂着 USB 配件。
+     *
+     * <p>用于把「无线首场必黑」的快速判死限制在无线链路上：USB 走 AOA，首场是正常的，
+     * 提前掐断反而会把好会话杀掉。
+     */
+    private boolean isUsbAttached() {
+        try {
+            android.hardware.usb.UsbManager um =
+                    (android.hardware.usb.UsbManager) appCtx.getSystemService(Context.USB_SERVICE);
+            if (um == null) {
+                return false;
+            }
+            android.hardware.usb.UsbAccessory[] list = um.getAccessoryList();
+            return list != null && list.length > 0;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private void cancelEarlyBail() {
+        main.removeCallbacks(earlyBailRunnable);
+        earlyBailArmed = false;
+    }
 
     // ==================================================================
     // SDK 回调
@@ -1267,8 +1303,21 @@ public class IccoaManager {
                 log("── 新一轮会话开始，诊断计时清零");
             }
             lastProgress = progress;
+
+            // ★ 秒断：本进程还没出过画面时，这一场在 progress 10 就已经注定失败。
+            //
+            //   ★★ 但**只在无线链路上**做。USB（AOA）是另一条通路，实测首场就能出画面，
+            //   在 700ms 处掐断会把一条本来正常的会话杀掉 —— 所以只要挂着 USB 配件就不秒断。
+            if (EARLY_BAIL_ENABLED && progress == 10 && !everSurfaceReady
+                    && !earlyBailArmed && castStarted && !isUsbAttached()) {
+                earlyBailArmed = true;
+                main.post(listener::onRecovering);
+                main.postDelayed(earlyBailRunnable, EARLY_BAIL_MS);
+            }
+
             if (progress == 90) {
                 tProgress90 = now;
+                stats.onProgress(progress);
                 // ★ 冷启动首场：从 progress 90 就开始计时。
                 //   90 之后手机才真正开始推流，健康会话的像素在 206~875ms 内到达；
                 //   而 90→100 那段协商还要 1.8 秒。等 100 再计时，等于白等这段。
@@ -1278,6 +1327,7 @@ public class IccoaManager {
             }
             if (progress >= 100 && tProgress100 == 0L) {
                 tProgress100 = now;
+                stats.onProgress(progress);
                 lastSegMs = (tProgress90 > 0L) ? (now - tProgress90) : -1L;
                 log("[诊断] 协商末段 90→100 = " + lastSegMs + "ms"
                         + "（startCast 至今 " + (now - tStartCast) + "ms）");
@@ -1332,9 +1382,29 @@ public class IccoaManager {
             listener.onNavigation(info);
         }
 
-        @Override public void onMusicInfoReceived(String phoneId, UCarCommon.MusicInfo info) { }
-        @Override public void onCallInfoReceived(String phoneId, UCarCommon.CallInfo info) { }
-        @Override public void onPhoneStateInfoReceived(String phoneId, UCarCommon.PhoneStateInfo info) { }
+        @Override
+        public void onMusicInfoReceived(String phoneId, UCarCommon.MusicInfo info) {
+            // 手机端曲目/播放状态。这里只做两件事：留一行日志、往上抛给 UI。
+            // 具体渲染（车机侧封面、进度条）留给后续版本，SDK 已经把数据送来了。
+            final String text = IccoaCarLink.describe(info);
+            if (musicLogBudget-- > 0) {
+                log("♪ " + text);
+            }
+            main.post(() -> listener.onMusicInfo(text));
+        }
+
+        @Override
+        public void onCallInfoReceived(String phoneId, UCarCommon.CallInfo info) {
+            // CallInfo 只在状态切换时来，量很小，全部记下来。
+            log("☎ callInfo " + (info == null ? "null" : info.toString()));
+        }
+
+        @Override
+        public void onPhoneStateInfoReceived(String phoneId, UCarCommon.PhoneStateInfo info) {
+            final String text = IccoaCarLink.describe(info);
+            log("☎ " + text);
+            main.post(() -> listener.onCallState(text));
+        }
         @Override public void onPOIReceived(String phoneId, UCarCommon.POIAddress poi) { }
         @Override public void onAudioFocusChanged(UCarCommon.AudioType type, int focus) { }
 
@@ -1372,7 +1442,7 @@ public class IccoaManager {
         // ★ fps 不再硬编码。跟随设置里的 FPS Limit（键名 fps-limit），默认 60 与原行为一致；
         //   骁龙 665 这类平台上 1080p60 编码余量不足，用户可以在设置里降到 30，
         //   不需要为此单独编译一版。
-        int fps = clamp(readIntSetting("fps-limit", 60), 15, 60);
+        int fps = clamp(readIntSetting(IccoaPrefs.KEY_FPS_LIMIT, 60), 15, 60);
         appliedFps = fps;
         int sw = Math.max(1, screenW), sh = Math.max(1, screenH);
         int vw = Math.max(1, videoW), vh = Math.max(1, videoH);
@@ -1396,7 +1466,7 @@ public class IccoaManager {
         //     1 = Hotspot     → 只声明 SoftAP（需系统热点处于开启状态）
         boolean useP2p = true, useAp = true;
         try {
-            int transport = readIntSetting("native-ap-transport", 1);
+            int transport = readIntSetting(IccoaPrefs.KEY_TRANSPORT, 1);
             useP2p = (transport == 0);
             useAp = !useP2p;
             log("通道能力: transport=" + transport + " → P2P=" + useP2p + " SoftAP=" + useAp);
@@ -1548,63 +1618,180 @@ public class IccoaManager {
      * @param viewW 承载画面的 View 宽度（像素）
      * @param viewH 承载画面的 View 高度（像素）
      */
+    /**
+     * 触控回传（UIBC）。
+     *
+     * <p>映射与节流都在 {@link IccoaTouch} 里，这里只负责调用 SDK 和记日志。
+     * 坐标基准是**视频画布**（{@code videoW} × {@code videoH}），不是面板；
+     * 具体怎么映射由设置项 {@code touch-fit-mode} 决定（拉伸 / 等比）。
+     */
     public void sendTouch(android.view.MotionEvent e, int viewW, int viewH) {
-        if (adapter == null || e == null) return;
-        if (viewW <= 0 || viewH <= 0) return;
-
-        final int action = e.getActionMasked();
-        // ★ 节流。车机触摸面板采样率通常 100~120Hz，逐事件转发会把 UIBC 通道塞满
-        //   （每帧 MOVE 都要组 JSON + 加密 + 走 RTP），在 2.4GHz 链路上反而把延迟推高。
-        //   把 MOVE 压到约 60Hz，DOWN / UP / CANCEL 一律不节流，保证点击手感。
-        final long now = android.os.SystemClock.uptimeMillis();
-        if (action == android.view.MotionEvent.ACTION_MOVE && now - lastTouchSentMs < 16L) {
+        if (adapter == null || e == null) {
             return;
         }
-        lastTouchSentMs = now;
-
-        final int count = e.getPointerCount();
-        final int[] ids = new int[count];
-        final int[] xs = new int[count];
-        final int[] ys = new int[count];
-        for (int i = 0; i < count; i++) {
-            ids[i] = e.getPointerId(i);
-            // ★ 归一化到「投屏内容」的坐标系（videoW x videoH），不是面板坐标系。
-            //   UIBC 的坐标基准是镜像画面的尺寸：SDK 内部按 displayWidth → sourceWidth 映射，
-            //   而 displayWidth 对应的是视频画布。之前用 screenW(2800) 传，视频只有 1280 宽，
-            //   映射后坐标全部越界，手机收到也落不到任何控件上 —— 表现就是「点了等于没点」。
-            xs[i] = Math.round(e.getX(i) * videoW / (float) viewW);
-            ys[i] = Math.round(e.getY(i) * videoH / (float) viewH);
-            // 钳制到画面内。车机触摸屏的边缘值可能略超出 View 范围（面板黑边、
-            // 系统手势区），越界坐标会被对端当成非法事件丢弃。
-            xs[i] = Math.max(0, Math.min(videoW - 1, xs[i]));
-            ys[i] = Math.max(0, Math.min(videoH - 1, ys[i]));
+        final int action = e.getActionMasked();
+        final long now = android.os.SystemClock.uptimeMillis();
+        if (touch.shouldDrop(action, now)) {
+            return;
         }
+
+        final boolean fit = IccoaPrefs.getInt(appCtx, IccoaPrefs.KEY_TOUCH_FIT, 0) == 1;
+        final int count = touch.map(e, viewW, viewH, videoW, videoH, fit);
+        if (count <= 0) {
+            return;
+        }
+
         try {
-            boolean ok = adapter.sendTouchEvent(action, count, ids, xs, ys);
-            // ★ 成功也要记一条。之前只在失败时打日志，结果「触摸没反应」时无从判断
+            boolean ok = adapter.sendTouchEvent(action, count,
+                    touch.ids(), touch.xs(), touch.ys());
+            // ★ 成功也要记一条。只在失败时打日志的话，「触摸没反应」时无从判断
             //   到底是事件没到、还是到了但被 SDK 拒、还是送到了手机但手机没执行。
-            //   预算 12 条足够看清一次按下-移动-抬起，又不会把诊断报告冲掉。
-            if (touchLogBudget > 0) {
-                touchLogBudget--;
+            if (touch.takeLogSlot()) {
                 log("触控回传 action=" + action + " count=" + count
                         + " view=" + viewW + "x" + viewH
                         + " video=" + videoW + "x" + videoH
-                        + " p0=(" + xs[0] + "," + ys[0] + ")"
+                        + (fit ? " 等比" : " 拉伸")
+                        + " p0=(" + touch.xs()[0] + "," + touch.ys()[0] + ")"
                         + " → " + (ok ? "已发送" : "被拒"));
             }
         } catch (Throwable t) {
-            if (touchLogBudget > 0) {
-                touchLogBudget--;
+            if (touch.takeLogSlot()) {
                 log("sendTouchEvent 异常: " + t);
             }
         }
     }
 
-    /** 触控失败日志的预算：避免每帧 MOVE 都刷屏把诊断报告冲掉。 */
-    private int touchLogBudget = 12;
+    // ==================================================================
+    // P2：车机 -> 手机 的能力（方控 / 日夜 / 电话 / 车况）
+    // ==================================================================
+    // 这些能力 SDK 早就提供了，只是上游从未调用过（见 docs/ICCOA-RUNTIME-FINDINGS.md §12）。
+    // 统一规则：只有「真的在投屏」时才发，避免对着一个不存在的会话空发指令。
 
-    /** 上一次转发 MOVE 的时刻，用于把触摸频率压到约 60Hz。 */
-    private long lastTouchSentMs = 0L;
+    /** P2 能力是否启用（设置项 iccoa-carlink）。 */
+    public boolean isCarLinkEnabled() {
+        return carLinkEnabled;
+    }
+
+    /**
+     * 方向盘 / 面板按键透传给手机。
+     *
+     * @return 是否真的发出去了（键码无法映射、没有会话时返回 false，由调用方决定是否本地处理）
+     */
+    public boolean sendKey(int keyCode, int action, int repeatCount) {
+        if (!carLinkEnabled || adapter == null || !castStarted) {
+            return false;
+        }
+        final boolean ok = IccoaCarLink.sendKey(adapter, keyCode, action, repeatCount);
+        if (ok && touch.takeLogSlot()) {
+            log("方控 → " + KeyEvent.keyCodeToString(keyCode)
+                    + " action=" + action + " repeat=" + repeatCount + " 已发送");
+        }
+        return ok;
+    }
+
+    /** 日夜模式同步。车机切深色时手机端界面也跟着切。 */
+    public void sendDayNight(boolean night) {
+        if (!carLinkEnabled || adapter == null || !castStarted) {
+            return;
+        }
+        final boolean ok = IccoaCarLink.sendDayNight(adapter, night);
+        lastDayNight = night;
+        lastDayNightSentAt = System.currentTimeMillis();
+        log("日夜同步 → " + (night ? "夜间" : "白天") + (ok ? " 已发送" : " 被拒"));
+    }
+
+    /** 接听来电。 */
+    public boolean answerCall() {
+        return carLinkEnabled && IccoaCarLink.answerCall(adapter);
+    }
+
+    /** 挂断 / 拒接。 */
+    public boolean hangUpCall() {
+        return carLinkEnabled && IccoaCarLink.hangUpCall(adapter);
+    }
+
+    private boolean lastDayNight = false;
+    private long lastDayNightSentAt = 0L;
+
+    // ---- 车况：GPS 回传 ----
+    // 车机定位通常比手机准（外置天线、隧道内惯性推算），发给手机后导航会明显更稳。
+    // 每 5 秒一次，且只在投屏期间发 —— 空发没有意义，还耗电。
+
+    private static final long GPS_INTERVAL_MS = 5000L;
+    private int gpsSentCount = 0;
+
+    private final Runnable gpsTick = new Runnable() {
+        @Override
+        public void run() {
+            if (!castStarted || !carLinkEnabled || !gpsUplinkEnabled) {
+                return;
+            }
+            try {
+                Location loc = lastKnownLocation();
+                if (loc != null && IccoaCarLink.sendGps(adapter, loc)) {
+                    gpsSentCount++;
+                    // 前两次各记一条，之后每 12 次（约 1 分钟）记一条，避免刷屏。
+                    if (gpsSentCount <= 2 || gpsSentCount % 12 == 0) {
+                        log("车况回传 GPS #" + gpsSentCount
+                                + " (" + String.format(java.util.Locale.US, "%.5f,%.5f", loc.getLatitude(), loc.getLongitude())
+                                + " 精度 " + Math.round(loc.getAccuracy()) + "m)");
+                    }
+                }
+            } catch (Throwable t) {
+                log("GPS 回传异常: " + t);
+            }
+            main.postDelayed(this, GPS_INTERVAL_MS);
+        }
+    };
+
+    private void startGpsTick() {
+        if (!gpsUplinkEnabled || !carLinkEnabled) {
+            return;
+        }
+        main.removeCallbacks(gpsTick);
+        main.postDelayed(gpsTick, 2000L);
+    }
+
+    private void cancelGpsTick() {
+        main.removeCallbacks(gpsTick);
+    }
+
+    /**
+     * 取最近一次已知位置。
+     *
+     * <p>用 {@code getLastKnownLocation} 而不是主动请求更新：车机定位通常由系统服务常驻维护，
+     * 主动注册 LocationListener 会在投屏期间持续唤醒 GNSS，功耗不划算。没有权限或没有
+     * 历史位置时返回 null，静默跳过。
+     */
+    private Location lastKnownLocation() {
+        try {
+            if (appCtx.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                    != PackageManager.PERMISSION_GRANTED) {
+                return null;
+            }
+            LocationManager lm = (LocationManager) appCtx.getSystemService(Context.LOCATION_SERVICE);
+            if (lm == null) {
+                return null;
+            }
+            Location best = null;
+            for (String provider : new String[]{LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER}) {
+                try {
+                    Location l = lm.getLastKnownLocation(provider);
+                    if (l != null && (best == null || l.getTime() > best.getTime())) {
+                        best = l;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            // 超过 2 分钟的定位不要：发给手机反而把导航带偏。
+            if (best != null && System.currentTimeMillis() - best.getTime() > 120_000L) {
+                return null;
+            }
+            return best;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
 
     private void log(String msg) {
         Log.i(TAG, msg);

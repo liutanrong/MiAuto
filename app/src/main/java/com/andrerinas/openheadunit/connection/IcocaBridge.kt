@@ -64,6 +64,10 @@ class IcocaBridge(context: Context) : IccoaManager.Listener {
         val castReady: Boolean = false,
         /** 首场会话没出帧，正在自动重建 —— 投屏页据此显示「正在重新建立画面」。 */
         val recovering: Boolean = false,
+        /** 手机端正在播放的曲目（"标题 / 歌手"）。没有媒体会话时为 null。 */
+        val music: String? = null,
+        /** 手机端电话状态（空闲 / 来电 / 通话中）。 */
+        val callState: String? = null,
     )
 
     private val _state = MutableStateFlow(State())
@@ -234,6 +238,49 @@ class IcocaBridge(context: Context) : IccoaManager.Listener {
     override fun onNavigation(info: UCarCommon.NavigationInfo?) {
         _navigation.value = info
     }
+
+    /**
+     * 手机端媒体信息。
+     *
+     * 目前只落到 [State.music] 供 UI 使用；车机侧要不要画封面/进度条是后续版本的事，
+     * 但数据通道先打通，免得以后又要改一遍 SDK 接线。
+     */
+    override fun onMusicInfo(text: String?) {
+        _state.update { it.copy(music = text) }
+    }
+
+    /** 手机端电话状态。 */
+    override fun onCallState(text: String?) {
+        _state.update { it.copy(callState = text) }
+    }
+
+    // ==================================================================
+    // P2：车机 -> 手机 的操作入口
+    // ==================================================================
+
+    /**
+     * 方控按键。
+     *
+     * @return true 表示这个键已经交给 ICCOA（调用方不要再本地处理）；
+     *         false 表示没有对应语义或当前没在投屏，交回系统默认分发。
+     */
+    fun handleKey(event: android.view.KeyEvent): Boolean {
+        if (event.action != android.view.KeyEvent.ACTION_DOWN &&
+            event.action != android.view.KeyEvent.ACTION_UP
+        ) {
+            return false
+        }
+        return manager.sendKey(event.keyCode, event.action, event.repeatCount)
+    }
+
+    /** 日夜模式同步。 */
+    fun sendDayNight(night: Boolean) = manager.sendDayNight(night)
+
+    /** 接听来电（方控「接听」键可用于这里）。 */
+    fun answerCall(): Boolean = manager.answerCall()
+
+    /** 挂断 / 拒接。 */
+    fun hangUpCall(): Boolean = manager.hangUpCall()
 
     /**
      * Moves the phase and keeps the stored PIN honest: a code only means something while the SDK is

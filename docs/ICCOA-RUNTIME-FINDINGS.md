@@ -424,8 +424,20 @@ start() ─ init(config) ─ onInitSuccess ─ startAdvertise ─ onPinCode
 | `onMusicInfoReceived` / `handleOnAudioPlayerControl` | 媒体信息与播放控制 |
 | `onNavigationInfoReceived` / `notifyPOIAddressReceived` | 导航信息、POI 下发 |
 
-> 这些都没有被上游使用。做「车机式界面」（导航/音乐/电话/方控）时，
-> 优先看 `sendKeyEvent`、`onMusicInfoReceived`、`notifyPickUpCall` 三条。
+> 0.3.0 起已接上其中五项：`sendKeyEvent`（方控）、`notifySwitchDayOrNight`（日夜）、
+> `notifyPickUpCall` / `notifyHungUpCall`（电话）、`sendGPSInfo`（车况）、
+> 以及 `onMusicInfoReceived` / `onPhoneStateInfoReceived` 的上抛。
+> 封装在 `IccoaCarLink` 里，实现细节见该文件的注释。
+>
+> 两个实现上的坑，写在这里省得再踩：
+>
+> - **`GPSInfo` 没有 setter**，运行期只有一个十参构造
+>   `(altitude, latitude, longitude, antennaState, pDop, speed, heading, satsUsed, satsVisible, timeStamp)`
+>   —— 顺序由字节码的 `iput` 顺序确定。而 `app/stubs/icar-sdk-stubs.jar` 是裁剪过的存根，
+>   **只有无参构造**，直接 `new GPSInfo(...)` 编译不过，必须反射。
+> - **`sendKeyEvent` 的第三个参数是 repeatCount**，不是键码。播放/暂停这类"切换"语义
+>   在 ICCOA 侧没有对应枚举（只有独立的 PLAY / PAUSE），所以只在按下时发一次，避免
+>   手机端把一次点击解释成"播放后又暂停"。
 
 ---
 
