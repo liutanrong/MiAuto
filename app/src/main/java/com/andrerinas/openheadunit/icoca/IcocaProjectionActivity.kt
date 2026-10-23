@@ -52,6 +52,8 @@ class IcocaProjectionActivity : AppCompatActivity() {
         // A projection session can run for a long time; never let the panel sleep mid-drive.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         acquireWifiLocks()
+        // 兜底：即使某些按键绕过 dispatchKeyEvent，也让它调媒体音量而不是铃声。
+        volumeControlStream = android.media.AudioManager.STREAM_MUSIC
         setContentView(R.layout.activity_icoca_projection)
         hideSystemUi()
 
@@ -155,10 +157,81 @@ class IcocaProjectionActivity : AppCompatActivity() {
     //   返回 true 表示已由 ICCOA 处理，不再交给本地控件；返回 false 说明这个键
     //   没有对应语义（比如音量）或者当前没在投屏，继续走原生分发。
     override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+        // 音量键先走本地：手机的镜像音频是在**车机**这条媒体流上播的，
+        // ICCOA 也没有 VOLUME_UP/DOWN 的键码（只有 MUTE），所以透传没有意义，
+        // 直接把车机的媒体音量调对，听感就是「音量键生效了」。
+        if (handleVolumeKey(event)) {
+            return true
+        }
         if (bridge.handleKey(event)) {
             return true
         }
         return super.dispatchKeyEvent(event)
+    }
+
+    // ---- 音量 ----
+
+    private val volumeKeys = intArrayOf(
+        android.view.KeyEvent.KEYCODE_VOLUME_UP,
+        android.view.KeyEvent.KEYCODE_VOLUME_DOWN,
+        android.view.KeyEvent.KEYCODE_VOLUME_MUTE,
+    )
+
+    private fun audioManager(): android.media.AudioManager? =
+        getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+
+    /**
+     * 音量键处理。
+     *
+     * @return true 表示这个键已经被消费，不再交给系统
+     */
+    private fun handleVolumeKey(e: android.view.KeyEvent): Boolean {
+        if (!volumeKeys.contains(e.keyCode)) {
+            return false
+        }
+        // 抬起与长按重复都要吞掉，否则系统会再自己调一次，出现"按一下跳两格"。
+        if (e.action != android.view.KeyEvent.ACTION_DOWN) {
+            return true
+        }
+        val am = audioManager() ?: return true
+        when (e.keyCode) {
+            android.view.KeyEvent.KEYCODE_VOLUME_UP ->
+                am.adjustStreamVolume(
+                    android.media.AudioManager.STREAM_MUSIC,
+                    android.media.AudioManager.ADJUST_RAISE, 0
+                )
+            android.view.KeyEvent.KEYCODE_VOLUME_DOWN ->
+                am.adjustStreamVolume(
+                    android.media.AudioManager.STREAM_MUSIC,
+                    android.media.AudioManager.ADJUST_LOWER, 0
+                )
+            android.view.KeyEvent.KEYCODE_VOLUME_MUTE ->
+                am.adjustStreamVolume(
+                    android.media.AudioManager.STREAM_MUSIC,
+                    android.media.AudioManager.ADJUST_TOGGLE_MUTE, 0
+                )
+        }
+        showVolumeOverlay(am)
+        return true
+    }
+
+    /** 画一个 1.2 秒的音量提示。系统在投屏全屏页里不一定给 HUD，自己画更可靠。 */
+    private fun showVolumeOverlay(am: android.media.AudioManager) {
+        val tv = findViewById<android.widget.TextView>(R.id.icoca_volume) ?: return
+        val max = am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+        val cur = am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)
+        val muted = am.isStreamMute(android.media.AudioManager.STREAM_MUSIC)
+        tv.text = if (muted) "静音" else "音量 ${cur * 100 / max}%"
+        tv.visibility = View.VISIBLE
+        tv.alpha = 1f
+        probeHandler.removeCallbacks(volumeHide)
+        probeHandler.postDelayed(volumeHide, 1200L)
+        AppLog.i("ICCOA: 音量键 → stream=MUSIC vol=$cur/$max muted=$muted")
+    }
+
+    private val volumeHide = Runnable {
+        val tv = findViewById<android.widget.TextView>(R.id.icoca_volume)
+        tv?.animate()?.alpha(0f)?.setDuration(220L)?.withEndAction { tv.visibility = View.GONE }?.start()
     }
 
     // 车机切换深色/浅色时同步给手机，手机端界面跟着变，夜间不刺眼。

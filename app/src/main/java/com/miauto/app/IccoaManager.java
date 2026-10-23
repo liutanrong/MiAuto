@@ -140,6 +140,80 @@ public class IccoaManager {
     private final IccoaSessionStats stats = new IccoaSessionStats();
     /** 触控映射与节流。 */
     private final IccoaTouch touch = new IccoaTouch();
+    /** USB 优先：插着配件时停掉蓝牙广播，让手机只能走 AOA。 */
+    private boolean usbPriority = true;
+    private boolean usbReceiverRegistered = false;
+
+    /**
+     * USB 配件插拔。
+     *
+     * <p>为什么要自己监听：无线一旦握手成功，SDK 会立刻 {@code stopAdvertise()}
+     * （反编译 {@code UCarAdapter$6.onReceivedClientAddress}），USB 再没有参与机会。
+     * 所以「USB 优先」只能靠**在手机挑通道之前把无线关掉**来实现 ——
+     * 插入时停广播，拔出时恢复。
+     */
+    private final android.content.BroadcastReceiver usbReceiver =
+            new android.content.BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, android.content.Intent intent) {
+                    String action = intent == null ? null : intent.getAction();
+                    boolean attached = android.hardware.usb.UsbManager.ACTION_USB_ACCESSORY_ATTACHED
+                            .equals(action);
+                    log("USB 配件" + (attached ? "已接入" : "已断开"));
+                    if (!usbPriority || adapter == null) {
+                        return;
+                    }
+                    if (attached) {
+                        if (sessionActive || castStarted) {
+                            // 已经有一条会话在跑，此时停广播也不会切通道，只是让日志更乱。
+                            log("USB 优先：当前会话进行中，不打断（下次插拔或重连时生效）");
+                            return;
+                        }
+                        boolean ok;
+                        try {
+                            ok = adapter.stopAdvertise();
+                        } catch (Throwable t) {
+                            ok = false;
+                        }
+                        log("USB 优先：停止蓝牙广播，只等数据线 " + (ok ? "成功" : "失败"));
+                    } else {
+                        boolean ok;
+                        try {
+                            ok = adapter.startAdvertise();
+                        } catch (Throwable t) {
+                            ok = false;
+                        }
+                        log("USB 优先：配件已拔出，恢复蓝牙广播 " + (ok ? "成功" : "失败"));
+                    }
+                }
+            };
+
+    private void registerUsbReceiver() {
+        if (usbReceiverRegistered) {
+            return;
+        }
+        try {
+            android.content.IntentFilter f = new android.content.IntentFilter();
+            f.addAction(android.hardware.usb.UsbManager.ACTION_USB_ACCESSORY_ATTACHED);
+            f.addAction(android.hardware.usb.UsbManager.ACTION_USB_ACCESSORY_DETACHED);
+            appCtx.registerReceiver(usbReceiver, f);
+            usbReceiverRegistered = true;
+        } catch (Throwable t) {
+            log("USB 插拔监听注册失败: " + t);
+        }
+    }
+
+    private void unregisterUsbReceiver() {
+        if (!usbReceiverRegistered) {
+            return;
+        }
+        try {
+            appCtx.unregisterReceiver(usbReceiver);
+        } catch (Throwable ignored) {
+        }
+        usbReceiverRegistered = false;
+    }
+
     /** P2 车联能力开关（方控 / 日夜 / 车况），启动时读一次。 */
     private boolean carLinkEnabled = true;
     private boolean gpsUplinkEnabled = true;
@@ -660,6 +734,8 @@ public class IccoaManager {
         musicLogBudget = 6;
         carLinkEnabled = IccoaPrefs.getBool(appCtx, IccoaPrefs.KEY_CAR_LINK, true);
         gpsUplinkEnabled = IccoaPrefs.getBool(appCtx, IccoaPrefs.KEY_GPS_UPLINK, true);
+        usbPriority = IccoaPrefs.getBool(appCtx, IccoaPrefs.KEY_USB_PRIORITY, true);
+        registerUsbReceiver();
         cancelEarlyBail();
         // 每次新会话重置首屏看门狗：重建次数按「单次连接」计，不能跨会话累计。
         castRebuildCount = 0;
@@ -812,6 +888,7 @@ public class IccoaManager {
         }
         main.removeCallbacks(reAdvertiseRunnable);
         cancelAutoRefresh();
+        unregisterUsbReceiver();
         sessionActive = false;
         castStarted = false;
         sdkReady = false;
@@ -848,6 +925,14 @@ public class IccoaManager {
 
     private void doAdvertise() {
         if (adapter == null) return;
+
+        // USB 优先：线插着就不广播，把无线这条路先关掉（详见 usbReceiver 的注释）。
+        if (usbPriority && isUsbAttached()) {
+            log("USB 优先：检测到 USB 配件，跳过蓝牙广播，只等 AOA 建链");
+            tryStartCast();
+            return;
+        }
+
         boolean ok = adapter.startAdvertise();
         log((ok ? "✓ " : "✗ ") + "startAdvertise() = " + ok);
         if (ok) {
@@ -1710,6 +1795,7 @@ public class IccoaManager {
                 + " GPS回传=" + (gpsUplinkEnabled ? "开" : "关")
                 + " 触控=" + (fit == 1 ? "等比" : "拉伸")
                 + " 秒断=" + (EARLY_BAIL_ENABLED ? "开" : "关")
+                + " USB优先=" + (usbPriority ? "开" : "关")
                 + " | USB配件=" + (isUsbAttached() ? "已连接" : "未连接"));
     }
 

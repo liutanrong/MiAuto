@@ -43,6 +43,14 @@ public final class IccoaPrefs {
     /** GPS 回传（把车机定位发给手机，手机导航可直接用）。默认开。 */
     public static final String KEY_GPS_UPLINK = "iccoa-gps-uplink";
 
+    /**
+     * USB 优先。默认开。
+     *
+     * <p>无线一旦握手成功，SDK 会立刻 stopAdvertise()，数据线再没有参与机会。
+     * 打开这一项后，插入 USB 配件会先停掉蓝牙广播，让手机只能走 AOA。
+     */
+    public static final String KEY_USB_PRIORITY = "iccoa-usb-priority";
+
     public static int getInt(Context ctx, String key, int def) {
         try {
             return prefs(ctx).getInt(key, def);

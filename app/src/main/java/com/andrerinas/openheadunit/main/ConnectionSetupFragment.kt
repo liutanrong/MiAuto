@@ -95,6 +95,21 @@ class ConnectionSetupFragment : Fragment() {
                 text(option, hint, 16)
             }
         }
+        // USB 优先。放在通道选择之后，因为它是"通道选择"的一个补充条件：
+        // 选了无线，但线插着的时候还要不要给无线机会。
+        card(root, getString(R.string.setup_usb_priority)) { box ->
+            box.addView(androidx.appcompat.widget.SwitchCompat(requireContext()).apply {
+                text = getString(R.string.setup_usb_priority_toggle)
+                setTextColor(color(R.color.da_text))
+                minHeight = dp(60)
+                isChecked = settings.usbPriority
+                setOnCheckedChangeListener { _, checked ->
+                    settings.usbPriority = checked
+                    render()
+                }
+            })
+            text(box, getString(R.string.setup_usb_priority_hint), 16)
+        }
         if (pendingCarHotspotSetup || (settings.wifiConnectionMode == 3 && settings.nativeApTransport == 1)) {
             card(root, getString(R.string.setup_configure_hotspot)) { box ->
                 text(box, getString(R.string.setup_hotspot_instructions), 16)

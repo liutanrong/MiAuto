@@ -1027,4 +1027,7 @@
     <string name="cluster_map_trigger_always">常开</string>
     <string name="cluster_map_trigger_cruise">巡航和导航</string>
     <string name="cluster_map_trigger_navigation">仅导航</string>
+    <string name="setup_usb_priority">USB 优先</string>
+    <string name="setup_usb_priority_toggle">插着数据线时只走线</string>
+    <string name="setup_usb_priority_hint">默认开启。无线一旦完成握手，ICCOA SDK 会立刻停掉蓝牙广播，数据线就再没有参与机会。打开这一项后，插入 USB 配件会停掉广播，让手机只能走数据线。想让「谁先连上算谁」就关掉它。</string>
 </resources>

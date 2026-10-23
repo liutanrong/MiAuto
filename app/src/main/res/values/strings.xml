@@ -1080,4 +1080,7 @@
     <string name="cluster_map_trigger_always">Always</string>
     <string name="cluster_map_trigger_cruise">Cruise + nav</string>
     <string name="cluster_map_trigger_navigation">Nav only</string>
+    <string name="setup_usb_priority">USB priority</string>
+    <string name="setup_usb_priority_toggle">Use the cable when one is plugged in</string>
+    <string name="setup_usb_priority_hint">On by default. Once a wireless link completes its handshake, the ICCOA SDK stops advertising — the cable then has no way in. With this on, connecting a USB accessory stops the Bluetooth advertisement so the phone can only use the cable. Turn it off if you prefer "whichever connects first".</string>
 </resources>

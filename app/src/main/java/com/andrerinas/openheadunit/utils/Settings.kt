@@ -1596,6 +1596,17 @@ class Settings(private val context: Context) {
         }
         set(value) = prefs.edit().putInt("native-ap-transport", if (value == 2) 1 else value).apply()
 
+    // USB 优先：插着 USB 配件时停掉 BLE 广播，让手机只能走 AOA。
+    //
+    // 默认开。理由：无线一旦握手成功，SDK 会立刻 stopAdvertise()
+    // （UCarAdapter$6.onReceivedClientAddress），USB 再没有参与机会 ——
+    // 想走线，就必须在手机挑通道之前把无线这条路关掉。
+    //
+    // 关掉它则回到「谁先连上算谁」，插着线但无线可用时仍然走无线。
+    var usbPriority: Boolean
+        get() = prefs.getInt("iccoa-usb-priority", 1) != 0
+        set(value) = prefs.edit().putInt("iccoa-usb-priority", if (value) 1 else 0).apply()
+
     // Whether the Native AA handshake opens with a WifiVersionRequest (Type 4), as real head units
     // and the OEM ZLink app do, instead of going straight to WifiStartRequest.
     //

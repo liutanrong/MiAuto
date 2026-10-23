@@ -68,6 +68,23 @@
 
     </LinearLayout>
 
+    <!-- 音量提示。车载音量键改动的是车机的媒体流（手机的镜像音频就播在这条流上），
+         但按键没有系统 HUD 反馈，所以自己画一个，1 秒后淡出。 -->
+    <TextView
+        android:id="@+id/icoca_volume"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="18dp"
+        android:background="#CC000000"
+        android:paddingStart="18dp"
+        android:paddingTop="8dp"
+        android:paddingEnd="18dp"
+        android:paddingBottom="8dp"
+        android:textColor="#FFFFFFFF"
+        android:textSize="16sp"
+        android:visibility="gone" />
+
     <!-- Sits over the mirrored UI on purpose: a head unit may have no reachable Back, so there
          must always be a way out. Kept translucent so it stays out of the way. -->
     <com.google.android.material.button.MaterialButton
