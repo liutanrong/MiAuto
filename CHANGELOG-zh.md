@@ -1,17 +1,25 @@
-# MiAuto 0.1.1 — 2026-10-13
+# MiAuto 0.2.1 — 2026-10-24
 
-- 仅文案修正，行为与 0.1.0 完全一致。ICCOA CarLink 是小米、OPPO、vivo 联合发起的标准，因此首页、「关于」「支持」页面、法务声明与文档统一改为并列书写「小米 CarWith / OPPO Car+ 车联 / vivo Jovi InCar」，不再只提小米。
-- 首页法务声明补充了 ICCOA CarLink 的说明：它是由三家联合发起的车内互联标准，手机侧前端分别是 CarWith、Car+ 与 Jovi InCar。
-- 新增繁体中文首页文案。此前该语言下没有对应文案，会显示英文。
+针对 DiLink 3.0（比亚迪秦 PLUS DM-i 2021 / Android 10 / 骁龙 665）的加固版本。
+以下每一条都由实机日志驱动，不是猜测；逆向与实测依据见 `docs/ICCOA-RUNTIME-FINDINGS.md`。
 
-# MiAuto 0.1.0 — 2026-10-13
+- **无线通道改为只声明一种。** 同时声明 Wi-Fi Direct 与 SoftAP 时，SDK 会按手机期望值二选一，
+  一旦对不上就 `notifyConnectFailed(3)` → 10003，表现为卡在 progress 10 约 15 秒。
+  现在跟随「网络通道」设置，只声明一种。
+- **SoftAP 不再让配置崩溃。** 空 5GHz 信道表会抛 `channels can't be null`，
+  `buildConfig()` 直接失败，界面上连配对码都不出现。现在只在 Wi-Fi Direct 分支设置。
+- **USB（AOA）真正可用。** 上游从未调用 `enableUsbDeviceDetection(true)`；
+  另外 Android Auto 栈有四处会抢读 accessory bulk 端点，已全部让开。
+- **DPI 跟随面板、帧率跟随设置。** 1920×990 约 172dpi（原来写死 320 导致车机端元素偏小）；
+  FPS 读「FPS Limit」设置，665 上可降到 30，无需单独编译。
+- **触控回传。** `sendTouchEvent()` 一直存在但从未被调用，车机上点什么都没反应。
+  现在坐标按视频画布归一化后回传。
+- **连接期间不再黑屏。** 用首帧探针（PixelCopy 64×36 统计非黑像素）替代 SDK 的
+  `onSurfaceReady()`——后者在正常会话里根本不会触发。投屏页在确认出画前一直盖着不透明品牌页。
+- **冷启动首场快速判死。** 进程启动后的第一次连接，手机不推视频流（五轮实测证据见文档）。
+  现在在 `progress 90 + 900ms` 无像素就断开重连，而不是在一个注定全黑的画面上等 9 秒。
+- **画质相关：** 低延迟解码模式真正生效（此前重复的 setter 把它覆盖成了 false）；
+  投屏期间持有 Wi-Fi 高性能锁与组播锁。
 
-- MiAuto 首个版本：把小米 CarWith、OPPO Car+ 车联与 vivo Jovi InCar 带上车的车机端应用，以 DiAuto Pro 与 Open Headunit 为基座。
-- 手机侧协议改用 ICCOA CarLink，不再依赖 Android Auto。车机通过蓝牙与 Wi-Fi（Wi-Fi Direct 或本地热点）与手机配对，也支持 USB。
-- 以独立包名 com.miauto.app 安装，可与 DiAuto 在同一台车机上共存。
-- 全面采用 MiAuto 品牌：毛玻璃风格 MA 启动图标与开屏、自有应用名、自有「关于」与「支持」页面。
-- 面向车机的首页会显示 CarLink 配对码，并提供连接、诊断、自动连接、显示与性能、权限等设置。
-- 支持诊断报告导出与自动重连；沿用 DiAuto 与 Open Headunit 的界面与主题。
-- 继承全部多语言支持，含简体中文与繁体中文。
+已知限制：冷启动后的首次连接仍需一次自动重连。这是手机端行为，车机侧无法修复。
 
-其他车机与持续性能不作保证。
