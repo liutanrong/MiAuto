@@ -14,6 +14,7 @@ import com.ucar.vehiclesdk.IAppSurfaceStateListener;
 import com.ucar.vehiclesdk.ICarConnectListener;
 import com.ucar.vehiclesdk.ICarInitCallback;
 import com.ucar.vehiclesdk.IPhoneDataListener;
+import com.andrerinas.openheadunit.BuildConfig;
 import com.ucar.vehiclesdk.UCarAdapter;
 import com.ucar.vehiclesdk.UCarCommon;
 import com.ucar.vehiclesdk.UCarConfig;
@@ -665,7 +666,15 @@ public class IccoaManager {
      * 构建标记。每次编版递增，启动时打一行 —— 这样从日志里就能确认
      * 「跑的是不是刚才那一版」，不用再靠某个字符串猜。
      */
-    public static final String BUILD_TAG = "dilinkfix-2026-10-24.22";
+    /**
+     * 诊断用的构建标记。
+     *
+     * <p>以前是手写的时间戳（dilinkfix-2026-10-24.22），每次发版都要记得改，
+     * 忘改就会出现「报告里的版本号和新包对不上」。改为直接取 Gradle 的
+     * versionName：debug 变体会是 {@code 0.2.1-debug}，release 是 {@code 0.2.1}，
+     * 永远与实际安装包一致。
+     */
+    public static final String BUILD_TAG = BuildConfig.VERSION_NAME;
 
     public void start() {
         log("构建标记 " + BUILD_TAG);
