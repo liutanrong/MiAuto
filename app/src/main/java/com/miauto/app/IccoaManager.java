@@ -523,6 +523,7 @@ public class IccoaManager {
         //   离屏 Surface 上 —— 等于把一条本来正常的链路黑一下。所以空配只做一次。
         primingPhase = false;
         cancelEarlyBail();
+        logCapabilities();
         cancelGpsTick();
         main.removeCallbacks(surfaceWatchdog);
         log("Surface 已销毁 → 状态清空");
@@ -1067,10 +1068,26 @@ public class IccoaManager {
      */
     private static final long COLD_START_TIMEOUT_MS = 900L;
 
+    /**
+     * USB 链路的冷启动等待。
+     *
+     * <p>USB（AOA）首连也慢，但性质不同：它是「慢，最后能出画面」，不是「这一场必然不出」。
+     * 实测里无线首场是零像素、必须重连；USB 只是首帧晚。所以这里不给它用 900ms 的快速判死，
+     * 也不做秒断 —— 那会把一条本来会成功的会话掐掉。
+     */
+    private static final long COLD_START_TIMEOUT_USB_MS = 6000L;
+
     private void scheduleSurfaceWatchdog() {
         main.removeCallbacks(surfaceWatchdog);
-        main.postDelayed(surfaceWatchdog,
-                everSurfaceReady ? SURFACE_READY_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+        final long timeout;
+        if (everSurfaceReady) {
+            timeout = SURFACE_READY_TIMEOUT_MS;
+        } else if (isUsbAttached()) {
+            timeout = COLD_START_TIMEOUT_USB_MS;
+        } else {
+            timeout = COLD_START_TIMEOUT_MS;
+        }
+        main.postDelayed(surfaceWatchdog, timeout);
     }
 
     /**
@@ -1309,10 +1326,19 @@ public class IccoaManager {
             //   ★★ 但**只在无线链路上**做。USB（AOA）是另一条通路，实测首场就能出画面，
             //   在 700ms 处掐断会把一条本来正常的会话杀掉 —— 所以只要挂着 USB 配件就不秒断。
             if (EARLY_BAIL_ENABLED && progress == 10 && !everSurfaceReady
-                    && !earlyBailArmed && castStarted && !isUsbAttached()) {
-                earlyBailArmed = true;
-                main.post(listener::onRecovering);
-                main.postDelayed(earlyBailRunnable, EARLY_BAIL_MS);
+                    && !earlyBailArmed && castStarted) {
+                if (isUsbAttached()) {
+                    // USB 首连也是慢，但「慢」不等于「不出」：实测它能出画面，只是首帧晚。
+                    // 掐断会给手机一次额外的 AOA 重协商，反而更慢，所以这里只放宽看门狗。
+                    earlyBailArmed = true;
+                    log("· 首场走 USB（AOA）：不做秒断，把首帧等待放宽到 "
+                            + COLD_START_TIMEOUT_USB_MS + "ms");
+                } else {
+                    earlyBailArmed = true;
+                    main.post(listener::onRecovering);
+                    main.postDelayed(earlyBailRunnable, EARLY_BAIL_MS);
+                    log("· 首场走无线：" + EARLY_BAIL_MS + "ms 后主动重连");
+                }
             }
 
             if (progress == 90) {
@@ -1667,6 +1693,26 @@ public class IccoaManager {
     // 这些能力 SDK 早就提供了，只是上游从未调用过（见 docs/ICCOA-RUNTIME-FINDINGS.md §12）。
     // 统一规则：只有「真的在投屏」时才发，避免对着一个不存在的会话空发指令。
 
+    /**
+     * 一行把「这一版到底开了什么」写进日志。
+     *
+     * <p>以前排查要翻设置页才知道用户开了哪些开关、跑的是哪条通道；现在报告开头就有。
+     * 装错包、开关没生效、USB 配件有没有插，都能一眼看出来。
+     */
+    private void logCapabilities() {
+        final int transport = readIntSetting(IccoaPrefs.KEY_TRANSPORT, 1);
+        final int fps = clamp(readIntSetting(IccoaPrefs.KEY_FPS_LIMIT, 60), 15, 60);
+        final int fit = IccoaPrefs.getInt(appCtx, IccoaPrefs.KEY_TOUCH_FIT, 0);
+        log("[能力] 通道=" + (transport == 0 ? "WiFi Direct(P2P)" : "车机热点(SoftAP)")
+                + " 视频=" + videoW + "x" + videoH
+                + " fps=" + fps
+                + " | 车联=" + (carLinkEnabled ? "开" : "关")
+                + " GPS回传=" + (gpsUplinkEnabled ? "开" : "关")
+                + " 触控=" + (fit == 1 ? "等比" : "拉伸")
+                + " 秒断=" + (EARLY_BAIL_ENABLED ? "开" : "关")
+                + " | USB配件=" + (isUsbAttached() ? "已连接" : "未连接"));
+    }
+
     /** P2 能力是否启用（设置项 iccoa-carlink）。 */
     public boolean isCarLinkEnabled() {
         return carLinkEnabled;
@@ -1678,13 +1724,21 @@ public class IccoaManager {
      * @return 是否真的发出去了（键码无法映射、没有会话时返回 false，由调用方决定是否本地处理）
      */
     public boolean sendKey(int keyCode, int action, int repeatCount) {
-        if (!carLinkEnabled || adapter == null || !castStarted) {
+        if (!carLinkEnabled) {
+            return false;
+        }
+        if (adapter == null || !castStarted) {
+            // 没会话时按键交给本地 —— 这时按返回/主页应该照常工作，不能吞掉。
+            if (touch.takeLogSlot()) {
+                log("方控 ← " + KeyEvent.keyCodeToString(keyCode) + "（当前没在投屏，交本地处理）");
+            }
             return false;
         }
         final boolean ok = IccoaCarLink.sendKey(adapter, keyCode, action, repeatCount);
-        if (ok && touch.takeLogSlot()) {
-            log("方控 → " + KeyEvent.keyCodeToString(keyCode)
-                    + " action=" + action + " repeat=" + repeatCount + " 已发送");
+        if (touch.takeLogSlot()) {
+            log("方控 " + (ok ? "→" : "✗") + " " + KeyEvent.keyCodeToString(keyCode)
+                    + " action=" + action + " repeat=" + repeatCount
+                    + (ok ? " 已发送" : " 无对应键码，交本地"));
         }
         return ok;
     }
@@ -1728,7 +1782,20 @@ public class IccoaManager {
             }
             try {
                 Location loc = lastKnownLocation();
-                if (loc != null && IccoaCarLink.sendGps(adapter, loc)) {
+                if (loc == null) {
+                    // 一分钟记一条，避免每 5 秒刷屏。
+                    if (gpsSentCount % 12 == 0) {
+                        log("GPS 回传跳过：没有可用的最近定位"
+                                + (hasLocationPermission() ? "" : "（缺 ACCESS_FINE_LOCATION 权限）"));
+                    }
+                    main.postDelayed(this, GPS_INTERVAL_MS);
+                    return;
+                }
+                if (!IccoaCarLink.sendGps(adapter, loc)) {
+                    if (gpsSentCount % 12 == 0) {
+                        log("GPS 回传被拒：SDK 未接受（GPSInfo 反射构造可能失败，详见 IccoaCarLink）");
+                    }
+                } else {
                     gpsSentCount++;
                     // 前两次各记一条，之后每 12 次（约 1 分钟）记一条，避免刷屏。
                     if (gpsSentCount <= 2 || gpsSentCount % 12 == 0) {
@@ -1743,6 +1810,15 @@ public class IccoaManager {
             main.postDelayed(this, GPS_INTERVAL_MS);
         }
     };
+
+    private boolean hasLocationPermission() {
+        try {
+            return appCtx.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                    == PackageManager.PERMISSION_GRANTED;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
 
     private void startGpsTick() {
         if (!gpsUplinkEnabled || !carLinkEnabled) {
