@@ -1,13 +1,7 @@
-# MiAuto 0.3.2 — 2026-10-24
+# MiAuto 0.3.3 — 2026-10-24
 
-- **Volume keys now work while projecting.** The mirrored audio plays on the head unit's media
-  stream, and ICCOA has no volume key codes (only mute), so forwarding them to the phone would
-  be meaningless. The projection screen now consumes VOLUME_UP / VOLUME_DOWN / VOLUME_MUTE,
-  adjusts the local music stream, and draws its own 1.2 s percentage overlay — the system does
-  not always show one on a full-screen projection activity.
-- **USB priority, on by default.** Once a wireless link completes its handshake the SDK calls
-  stopAdvertise(), which shuts the cable out for the rest of the session. With USB priority
-  enabled, attaching a USB accessory stops the Bluetooth advertisement so the phone can only
-  come in over AOA; detaching restores it. Switchable in Connection setup → "USB priority".
-  Turn it off for "whichever connects first".
+- **USB priority now has a way back.** If an accessory is attached but no AOA link comes up
+  within 10 s (a charge-only cable, or a phone that will not switch to accessory mode), the
+  Bluetooth advertisement is restored automatically. Without the fallback the app would sit
+  on "waiting for phone" with no pairing code and no way forward.
 

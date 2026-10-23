@@ -188,6 +188,33 @@ public class IccoaManager {
                 }
             };
 
+    /** USB 优先的兜底等待：到点还没建链就恢复广播。 */
+    private static final long USB_PRIORITY_FALLBACK_MS = 10_000L;
+
+    private final Runnable usbPriorityFallback = new Runnable() {
+        @Override
+        public void run() {
+            if (!usbPriority || adapter == null) {
+                return;
+            }
+            if (sessionActive || castStarted) {
+                return;
+            }
+            log("USB 优先：10 秒内没有 AOA 建链 → 回退到蓝牙广播（手机可能不走数据线）");
+            boolean ok;
+            try {
+                ok = adapter.startAdvertise();
+            } catch (Throwable t) {
+                ok = false;
+            }
+            log("USB 优先：回退广播 " + (ok ? "成功" : "失败"));
+            if (ok) {
+                schedulePinWatchdog();
+            }
+            tryStartCast();
+        }
+    };
+
     private void registerUsbReceiver() {
         if (usbReceiverRegistered) {
             return;
@@ -887,6 +914,7 @@ public class IccoaManager {
             } catch (Throwable ignored) { }
         }
         main.removeCallbacks(reAdvertiseRunnable);
+        main.removeCallbacks(usbPriorityFallback);
         cancelAutoRefresh();
         unregisterUsbReceiver();
         sessionActive = false;
@@ -927,8 +955,13 @@ public class IccoaManager {
         if (adapter == null) return;
 
         // USB 优先：线插着就不广播，把无线这条路先关掉（详见 usbReceiver 的注释）。
+        //
+        // ★ 必须带兜底：有些车机/线材只供电不跑 AOA 数据，这时如果不广播，手机永远
+        //   发现不了车机，界面上连配对码都不会出现。所以 10 秒内没建链就退回广播。
         if (usbPriority && isUsbAttached()) {
-            log("USB 优先：检测到 USB 配件，跳过蓝牙广播，只等 AOA 建链");
+            log("USB 优先：检测到 USB 配件，跳过蓝牙广播，只等 AOA 建链（10 秒无果则回退）");
+            main.removeCallbacks(usbPriorityFallback);
+            main.postDelayed(usbPriorityFallback, USB_PRIORITY_FALLBACK_MS);
             tryStartCast();
             return;
         }
@@ -1339,6 +1372,7 @@ public class IccoaManager {
                 scheduleReAdvertise();
                 scheduleAutoRefresh();
             } else if (newState == 1) {
+                main.removeCallbacks(usbPriorityFallback);
                 // ★ 协商中：也要置 sessionActive，否则 30 秒看门狗会在鉴权进行到一半时
                 //   stop→start 重播，把正在跑的会话连根拔掉（实测 vivo 上就是卡在这一步）。
                 //   改用更长的 CONNECTING_TIMEOUT 兜底，超时才放开。
