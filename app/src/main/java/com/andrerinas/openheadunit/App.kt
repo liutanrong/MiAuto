@@ -32,6 +32,7 @@ class App : Application() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        installCrashLogger()
 
 
 
@@ -127,6 +128,34 @@ class App : Application() {
         }
         fun provide(context: Context): AppComponent {
             return get(context).component
+        }
+    }
+
+    /**
+     * 崩溃兜底：把未捕获异常同步写进 logcat 与文件。
+     *
+     * 这里刻意不用 AppLog（它走队列 + 后台线程，进程被杀时来不及落盘），
+     * 直接 android.util.Log.e + 立即 writeText。
+     * 下一份诊断报告读的是 logcat，所以这一行 OPENHU FATAL 会跟着进去，
+     * 不用再指望用户去接 adb。
+     */
+    private fun installCrashLogger() {
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+            try {
+                android.util.Log.e("OPENHU", "FATAL-UNCAUGHT thread=" + thread.name, error)
+            } catch (_: Throwable) {
+            }
+            try {
+                val dir = getExternalFilesDir(null) ?: filesDir
+                java.io.File(dir, "crash-last.txt").writeText(
+                    "time=" + java.lang.System.currentTimeMillis() +
+                        " thread=" + thread.name + "\n" +
+                        android.util.Log.getStackTraceString(error)
+                )
+            } catch (_: Throwable) {
+            }
+            previous?.uncaughtException(thread, error)
         }
     }
 }

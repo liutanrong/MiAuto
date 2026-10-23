@@ -7,6 +7,10 @@
     <color name="da_text">#F1F5FC</color>
     <color name="da_muted">#A8B6CA</color>
     <string name="da_brand">MiAuto</string>
+    <!-- 投屏页过渡遮罩上的品牌字样。沿用 da_brand 会让「等待画面」和首页看起来是同一屏，
+         这里单独给一个更轻的标记，避免用户误以为卡在首页。 -->
+    <string name="icoca_veil_brand">MiAuto</string>
+    <string name="icoca_pin_hint">在手机上输入配对码</string>
     <string name="da_tagline">MIAUTOCAR · HEAD UNIT</string>
     <string name="da_headline">Your phone, on your car screen.</string>
     <string name="da_description">Mirror your phone to this screen or to the cluster / HUD.\nOpen Xiaomi CarWith, OPPO Car+ or vivo Jovi InCar on your phone and pick this car to start.</string>

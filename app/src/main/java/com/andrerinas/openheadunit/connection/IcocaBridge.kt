@@ -54,6 +54,16 @@ class IcocaBridge(context: Context) : IccoaManager.Listener {
          * the SDK stalls at 80% because there is no Surface, so it never reports Connected.
          */
         val progress: Int = 0,
+        /**
+         * 第一帧已经解码出来（SDK 的 onSurfaceReady）。
+         *
+         * 投屏页的「正在连接」提示以它为准：`phase` 在会话重建时会被 SDK 的 CONNECTING 改回
+         * Pairing，而 startCast 不会每次都重发，于是提示会永久挂在那儿 —— 用户看到的就是
+         * "已经连上了还显示正在连接"。
+         */
+        val castReady: Boolean = false,
+        /** 首场会话没出帧，正在自动重建 —— 投屏页据此显示「正在重新建立画面」。 */
+        val recovering: Boolean = false,
     )
 
     private val _state = MutableStateFlow(State())
@@ -135,6 +145,10 @@ class IcocaBridge(context: Context) : IccoaManager.Listener {
     fun setSurface(surface: Surface, width: Int, height: Int) =
         manager.setSurface(surface, width, height)
 
+    fun onSurfaceDestroyed() = manager.onSurfaceDestroyed()
+
+    fun rebindAfterResume() = manager.rebindAfterResume()
+
     /** Last PIN the SDK issued, or null. Useful when the projection activity opens late. */
     fun lastPinCode(): String? = manager.lastPinCode
 
@@ -178,7 +192,43 @@ class IcocaBridge(context: Context) : IccoaManager.Listener {
 
     override fun onProgress(progress: Int) {
         AppLog.i("ICCOA: progress $progress")
-        _state.update { it.copy(progress = progress) }
+        _state.update {
+            when {
+                // 新会话开始：先把上一轮的"首帧已出"清掉
+                // 首个进度事件可能是 10 也可能是 20；0 是断开，不清 castReady
+                progress in 1..20 -> it.copy(progress = progress, castReady = false, phase = Phase.Pairing)
+                // 协商走完，即使 SDK 之后再发 -1，也不该退回"正在连接"
+                progress >= 100 -> it.copy(progress = progress, phase = Phase.Connected)
+                else -> it.copy(progress = progress)
+            }
+        }
+    }
+
+    override fun onFirstFrame() {
+        AppLog.i("ICCOA: first frame rendered")
+        _state.update { it.copy(castReady = true, recovering = false, phase = Phase.Connected) }
+    }
+
+    /**
+     * 像素采样确认画面已经在屏幕上。
+     *
+     * 与 [onFirstFrame] 的区别只在**判据来源**：那个来自 SDK 的 `onSurfaceReady()`，
+     * 这个来自投屏页对 Surface 的真实像素拷贝。SDK 那条链在
+     * `mLastReadyCountTime` / `mLastShownTime` 等内部状态不满足时会永久不回调
+     * （已通过反编译 `VideoPlayerV2$1.onOutputBufferAvailable` 确认），
+     * 而画面其实在正常播放。两条任一到达都算「有画面」。
+     */
+    override fun onFrameVisible() {
+        AppLog.i("ICCOA: frame visible (pixel probe)")
+        _state.update { it.copy(castReady = true, recovering = false, phase = Phase.Connected) }
+    }
+
+    /** 投屏页像素采样成功后回灌，用来解除 IccoaManager 的首屏看门狗。 */
+    fun onPixelsVisible() = manager.onPixelsVisible()
+
+    override fun onRecovering() {
+        AppLog.i("ICCOA: recovering — first frame never arrived, restarting the session")
+        _state.update { it.copy(recovering = true, castReady = false) }
     }
 
     override fun onNavigation(info: UCarCommon.NavigationInfo?) {

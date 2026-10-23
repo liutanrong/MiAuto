@@ -11,6 +11,7 @@ import android.os.Build
 import android.widget.Toast
 import androidx.core.content.ContextCompat
 import com.andrerinas.openheadunit.App
+import com.andrerinas.openheadunit.BuildConfig
 import com.andrerinas.openheadunit.R
 import com.andrerinas.openheadunit.aap.AapService
 import com.andrerinas.openheadunit.connection.CommManager
@@ -78,6 +79,20 @@ class UsbAttachedActivity : Activity() {
         if (device == null || !UsbDeviceCompat.isAndroidDevice(device)) {
             if (device != null) {
                 AppLog.i("Ignoring non-Android USB device in onCreate (VID: ${device.vendorId}): ${device.deviceName}")
+                // ★ AOA 探测。手机插上时报告的是 MTP（如 2D95:xxxx），要切到 accessory 模式
+                //   （18D1:2D00）必须由 host 侧发 ACCESSORY_START 控制请求，而发这个请求的前提
+                //   是先拿到 UsbDevice 的访问权限。上游只对 AA 设备请求权限，手机一律被忽略，
+                //   所以车机端从来没有触发过 AOA —— 这正是"手机一直停在文件传输"的原因。
+                //   这里对所有设备都请求一次，日志能看出系统是否弹窗、用户是否允许。
+                if (BuildConfig.ICCOA_ONLY) {
+                    val um = getSystemService(Context.USB_SERVICE) as UsbManager
+                    val has = um.hasPermission(device)
+                    AppLog.i("AOA 探测: hasPermission=$has vid=${device.vendorId} pid=${device.productId}")
+                    if (!has) {
+                        um.requestPermission(device, UsbReceiver.createPermissionPendingIntent(this))
+                        AppLog.i("AOA 探测: 已请求 USB 权限（系统应弹出「允许访问设备」）")
+                    }
+                }
             }
             finish()
             return
@@ -102,6 +117,18 @@ class UsbAttachedActivity : Activity() {
                 AppLog.i("Usb in accessory mode but no permission. Requesting...")
                 val permissionIntent = UsbReceiver.createPermissionPendingIntent(this)
                 usbManager.requestPermission(device, permissionIntent)
+                finish()
+                return
+            }
+            if (BuildConfig.ICCOA_ONLY) {
+                // ★ 配件归 ICCOA SDK。这里如果照样去启 AapService，AA 的 AapTransport
+                //   会用另一个 reader 打开同一个 accessory 的 bulk 端点，把 ICCOA 的
+                //   数据读走 —— 日志里就是这样：
+                //     Handshake: Drained 422894 bytes of stale USB data
+                //     Handshake: Ignoring unexpected message (ch=5, len=16384)
+                //   ch=5 / 16KB 的负载就是 ICCOA 的视频流。两个 reader 平分数据，
+                //   手机端收不到 ACK，于是停在它自己的启动页。
+                AppLog.i("ICCOA-only: accessory left to the ICCOA SDK; not starting AapService")
                 finish()
                 return
             }

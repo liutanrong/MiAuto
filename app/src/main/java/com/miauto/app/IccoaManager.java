@@ -7,8 +7,10 @@ import android.os.Looper;
 import android.util.Base64;
 import android.util.Log;
 import android.view.Surface;
+import android.graphics.SurfaceTexture;
 
 import com.share.connect.WifiOwnerConfig;
+import com.ucar.vehiclesdk.IAppSurfaceStateListener;
 import com.ucar.vehiclesdk.ICarConnectListener;
 import com.ucar.vehiclesdk.ICarInitCallback;
 import com.ucar.vehiclesdk.IPhoneDataListener;
@@ -49,6 +51,31 @@ public class IccoaManager {
         void onProgress(int progress);
         void onPinCode(String pinCode, String carDeviceName);
         void onCastStarted();
+        /**
+         * 画面真的出现在屏幕上了（像素级确认，不是 SDK 回调）。
+         *
+         * <p>为什么需要它：反编译 {@code VideoPlayerV2$1.onOutputBufferAvailable} 可见
+         * {@code onSurfaceReady()} 的触发条件是
+         * <pre>
+         *   mNeedRender == true
+         *   &amp;&amp; mIsSurfaceAlReady == false
+         *   &amp;&amp; mLastReadyCountTime != -1
+         *   &amp;&amp; mLastReadyCountTime &gt;= presentationTimeUs
+         * </pre>
+         * 其中 {@code mLastReadyCountTime} 只在「输入侧第一帧且 mLastShownTime == 0」时才被赋值。
+         * 只要任一条件不成立，**画面已经在放，回调却永远不来** —— 上层就会一直以为黑屏。
+         * 所以真正的判据必须由我们自己采样 Surface 像素得到。
+         */
+        void onFrameVisible();
+        /**
+         * 第一帧真正解码出来（SDK 的 onSurfaceReady）。
+         *
+         * <p>它和 {@link #onCastStarted()} 不是一回事：后者只表示 startCast 调用被接受，
+         * 那时可能还在协商；只有这一条才代表"画面已经出来了"，UI 上该把提示收掉的依据是它。
+         */
+        void onFirstFrame();
+        /** 首场会话拿不到首帧、正在自动重建（UI 可据此提示"重新建立画面"）。 */
+        void onRecovering();
         /** 手机导航信息（POC-2 / BYD 仪表与 HUD 的数据源）。 */
         void onNavigation(UCarCommon.NavigationInfo info);
     }
@@ -72,6 +99,77 @@ public class IccoaManager {
     private volatile boolean castStarted = false;
     /** 上一次 init() 时实际采用的通道（native-ap-transport 的值），用于检测配置变更。 */
     private int appliedTransport = Integer.MIN_VALUE;
+
+    /** SDK 是否已确认有画面（SDK 回调或像素采样，任一先到）。 */
+    private volatile boolean surfaceReady = false;
+    /** 等不到首帧时的重建次数，防止死循环。 */
+    private int castRebuildCount = 0;
+    /** 本进程内是否成功出过一次画面，用来区分「冷启动首连」与「中途失效」。 */
+    private volatile boolean everSurfaceReady = false;
+
+    // ---- 单次会话的诊断计时（一次上报，避免来回抓包） ----
+    private long tStartCast = 0L;
+    private long tProgress90 = 0L;
+    private long tProgress100 = 0L;
+    private long tSurfaceReadyAt = 0L;
+    private int appliedFps = 0;
+    private long lastSegMs = -1L;
+    private long lastFirstFrameMs = -1L;
+    /** true 表示 lastFirstFrameMs 是「距 startCast」，false 表示「距 progress100」。 */
+    private boolean firstFrameFromStart = false;
+    /** 最近一次收到的协商进度，用于在 startCast 日志里确认「是否早于媒体协商」。 */
+    private volatile int lastProgress = 0;
+    /** 预热用的离屏 Surface（2x2）+ 它的 ImageReader，保持引用防止被回收。 */
+    private android.media.ImageReader prewarmReader = null;
+    private Surface prewarmSurface = null;
+    /** 是否已经预热过；只在进程生命周期内做一次。 */
+    private boolean decoderPrewarmed = false;
+
+    // ---- 「先空配、后交接」：让首场会话也走 setOutputSurface 这条稳的路 ----
+    /**
+     * 反编译 {@code CastManager.startCast}：
+     * <pre>
+     *   if (mVideoPlayer == null) mVideoPlayer = new VideoPlayerV2(...);
+     *   mVideoPlayer.init(surface, w, h, ...);
+     *   if (!mVideoPlayer.isStart()) mVideoPlayer.start();
+     *   mVideoPlayer.enableRender(true);
+     * </pre>
+     * 而 {@code VideoPlayerV2.init} 分两条路：
+     * <ul>
+     *   <li>{@code !mIsConfigured} → {@code MediaFormat.createVideoFormat(mime,w,h)} +
+     *       {@code codec.configure(format, surface)} + {@code mIsFirstLaunch = true} +
+     *       {@code mVideoQueueManager.clearDataIfNeeded()} ← <b>首场必走这条</b></li>
+     *   <li>{@code mIsConfigured} → 只 {@code codec.setOutputSurface(surface)} ← <b>第二场走这条</b></li>
+     * </ul>
+     * 日志里稳定的规律是「首场黑、第二场好」，与这两条分支完全对应 —— 问题不在手机端，
+     * 而在第一次 configure 把解码器绑到了「协商还没完成」的早期状态。
+     *
+     * <p>所以这里主动制造「第二场」的条件：第一次投屏时先用一块 <b>与视频同尺寸</b> 的
+     * 离屏 Surface 完成 configure，300ms 后再把真实 Surface 交接过去 —— 走的就是
+     * {@code setOutputSurface}，也就是每次都能出画面的那条分支。
+     *
+     * <p>尺寸必须与 {@code videoW x videoH} 一致：之前用 2x2 的 ImageReader 预热，
+     * configure 出来的 format 与真实码流差着三个数量级，解码器直接不出帧，这就是
+     * 那版预热「执行了但没用」的原因。
+     */
+    private boolean handoffPrimed = false;
+    private SurfaceTexture primeTexture = null;
+    private Surface primeSurface = null;
+    /** 空配开始的时刻。用来防止 surfaceChanged 抢在 configure 完成前触发交接。 */
+    private long primeStartedAt = 0L;
+    /**
+     * 是否仍处在「空配 → 真实 Surface」的过渡期。
+     *
+     * <p>这段时间里解码器的输出面是离屏的那块，任何 {@code onSurfaceReady} 都不代表
+     * 车机屏幕上有了画面。不屏蔽掉的话，界面会在真正出帧之前就撤掉过渡遮罩，
+     * 用户看到的反而是一段纯黑 —— 比等久一点更糟。
+     */
+    private volatile boolean primingPhase = false;
+
+    /** 每次会话只打印一次「实际走的哪条通道」。 */
+    private volatile boolean connectTypeLogged = false;
+    /** 最近一次真实设备 ID（SDK 在会话切换时会给 "-1"，那个查不到设备）。 */
+    private volatile String lastDeviceId = null;
     private volatile String lastPinCode = null;
 
     /** 会话结束后重新广播的延时：留出 SDK 内部收尾时间，避免与断连流程竞争。 */
@@ -80,6 +178,8 @@ public class IccoaManager {
     //   被对端直接拒掉（progress 10 → 0 → 10003），而不是等 15 秒超时 —— 两种失败形态
     //   在日志里能明显区分。留足拆除时间，重连才稳定。
     private static final long RE_ADVERTISE_DELAY_MS = 5000L;
+    /** 首屏失败后的重播延时：没有稳定数据面要拆，不必等 5 秒。 */
+    private static final long WATCHDOG_RE_ADVERTISE_DELAY_MS = 1000L;
 
     /**
      * 配对码自动刷新周期。
@@ -108,8 +208,23 @@ public class IccoaManager {
     };
 
     private void scheduleReAdvertise() {
+        scheduleReAdvertise(RE_ADVERTISE_DELAY_MS);
+    }
+
+    /**
+     * 指定延时的重播。
+     *
+     * 正常断线（用户点「断开」、或远场断开）用 5 秒：P2P 组的 group interface 拆除要几秒，
+     * 太早重播会让手机撞到半拆除的组，36 毫秒内被直接拒掉。
+     *
+     * 但「首屏看门狗」这条路不一样——那条会话从头到尾没出过一帧，手机端也停在它自己的
+     * 启动页，没有稳定的数据面要拆，等 5 秒纯属浪费。日志实测：重播之后 2.2 秒手机就回来了，
+     * 所以这条分支只等 2 秒。
+     */
+    private void scheduleReAdvertise(long delayMs) {
         main.removeCallbacks(reAdvertiseRunnable);
-        main.postDelayed(reAdvertiseRunnable, RE_ADVERTISE_DELAY_MS);
+        main.postDelayed(reAdvertiseRunnable, delayMs);
+        log("计划重播：+" + delayMs + "ms");
     }
 
     /**
@@ -218,6 +333,297 @@ public class IccoaManager {
     public String getLastPinCode() { return lastPinCode; }
 
     /** Surface 就绪 / 变化（Activity 的 surfaceChanged 回调里调用）。 */
+    /**
+     * Surface 被销毁：倒车影像、系统浮层、Activity 重建都会走到这里。
+     * 必须清空引用与尺寸，否则重建出来的 Surface 若恰好是同一个对象，
+     * setSurface 的去重判断会认为「没变化」，直接跳过重投 —— 表现就是切完倒车回来黑屏。
+     */
+    /**
+     * 预热解码器（进程内只做一次）。
+     *
+     * <p>日志里反复出现的规律：进程启动后的**第一场会话从来不出帧**，断开重连的第二场
+     * 一定正常 —— 而两次唯一的差别是 `VideoPlayerV2.mIsConfigured`：
+     *
+     * <pre>
+     *   第一次 startCast → init() 走 configureDecoder 分支：
+     *       MediaFormat.createVideoFormat(mime, w, h)
+     *       codec.configure(format, surface, ...)
+     *       mIsFirstLaunch = true
+     *       VideoQueueManager.clearDataIfNeeded()   ← 清空已到达的帧
+     *   之后 startCast → init() 只调 codec.setOutputSurface(surface)
+     * </pre>
+     *
+     * 也就是说，只要在**任何会话开始之前**先把解码器 configure 掉，真实会话进来时就只会
+     * 走 setOutputSurface，不会再被那次 clearData 吃掉首个关键帧。
+     *
+     * 这里用一块 2x2 的 ImageReader Surface 做这次"空配置"：没有会话就没有帧，
+     * 解码器只是建好待命；真实 Surface 到位时再 startCast 一次，走的正是 setOutputSurface。
+     * 失败不影响主链路，所有异常都吞掉并记日志。
+     */
+    private void prewarmDecoder() {
+        if (decoderPrewarmed) return;
+        decoderPrewarmed = true;
+        try {
+            if (adapter == null) return;
+            prewarmReader = android.media.ImageReader.newInstance(
+                    2, 2, android.graphics.PixelFormat.RGBA_8888, 2);
+            prewarmReader.setOnImageAvailableListener(reader -> {
+                try {
+                    android.media.Image img = reader.acquireLatestImage();
+                    if (img != null) img.close();
+                } catch (Throwable ignored) {
+                }
+            }, new android.os.Handler(android.os.Looper.getMainLooper()));
+            prewarmSurface = prewarmReader.getSurface();
+            boolean ok = adapter.startCast(prewarmSurface, videoW, videoH, surfaceStateListener);
+            log("预热解码器 startCast(2x2 离屏, 配置 " + videoW + "x" + videoH + ") = " + ok);
+        } catch (Throwable t) {
+            log("预热解码器失败（不影响主链路）: " + t);
+        }
+    }
+
+    /** 释放预热用资源。 */
+    private void releasePrewarm() {
+        try {
+            if (prewarmSurface != null) prewarmSurface.release();
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (prewarmReader != null) prewarmReader.close();
+        } catch (Throwable ignored) {
+        }
+        prewarmSurface = null;
+        prewarmReader = null;
+    }
+
+    /** 离屏预热 Surface 交给真实 Surface 之前的缓冲时间：够 configure + start 完成。 */
+    private static final long PRIME_HANDOFF_DELAY_MS = 300L;
+
+    /**
+     * 用一块「与视频同尺寸」的离屏 Surface 先把解码器 configure 掉。
+     *
+     * <p>这是本版的核心修法。反编译证据：{@code VideoPlayerV2.init()} 只有
+     * {@code mIsConfigured == false} 时才会执行 {@code MediaCodec.configure(format, surface)}
+     * 并把 {@code mIsFirstLaunch} 置 true；之后任何一次 {@code startCast} 都只调
+     * {@code setOutputSurface}。而「首场黑、第二场好」正是这两条分支的分界。
+     *
+     * <p>所以第一次投屏时，先拿一块尺寸正确的 {@link SurfaceTexture} 离屏 Surface 走一遍
+     * configure，再在 {@link #PRIME_HANDOFF_DELAY_MS} 后把真实 Surface 交过去 —— 真实会话
+     * 走的就是 {@code setOutputSurface}，与第二场完全同路径。
+     *
+     * <p><b>尺寸必须等于 videoW x videoH</b>。早前那版预热用 2x2 的 ImageReader，configure
+     * 出的 format 与真实码流差三个数量级，解码器不出帧，所以「执行了却没效果」。
+     *
+     * @return true 表示 configure 已被消耗掉，调用方应在延时后交接真实 Surface
+     */
+    private boolean primeDecoderOffscreen() {
+        if (adapter == null) return false;
+        try {
+            if (primeSurface != null) return true;   // 已备好，直接交接
+            primeTexture = new SurfaceTexture(false);
+            primeTexture.setDefaultBufferSize(videoW, videoH);
+            // 必须持续消费帧：SurfaceTexture 不 updateTexImage 的话 BufferQueue 很快塞满，
+            // 解码器会卡在 releaseOutputBuffer 上，真实会话反而更慢。
+            primeTexture.setOnFrameAvailableListener(st -> {
+                try {
+                    st.updateTexImage();
+                } catch (Throwable ignored) {
+                }
+            }, new android.os.Handler(android.os.Looper.getMainLooper()));
+            primeSurface = new Surface(primeTexture);
+            primingPhase = true;
+            primeStartedAt = System.currentTimeMillis();
+            boolean ok = adapter.startCast(primeSurface, videoW, videoH, surfaceStateListener);
+            log((ok ? "✓ " : "✗ ") + "离屏空配 startCast(" + videoW + "x" + videoH + ") = " + ok
+                    + "，+" + PRIME_HANDOFF_DELAY_MS + "ms 后交接真实 Surface");
+            if (!ok) primingPhase = false;
+            return ok;
+        } catch (Throwable t) {
+            log("离屏空配失败（退回直接投屏，行为同旧版）: " + t);
+            releasePrime();
+            return false;
+        }
+    }
+
+    /** 释放空配用的离屏 Surface。真实 Surface 接手后它就没用了。 */
+    private void releasePrime() {
+        try {
+            if (primeSurface != null) primeSurface.release();
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (primeTexture != null) primeTexture.release();
+        } catch (Throwable ignored) {
+        }
+        primeSurface = null;
+        primeTexture = null;
+    }
+
+    /**
+     * 打印手机在 ClientHello 里声明的实际通道。
+     *
+     * 反编译 UCarConnectProxy$2.receivedClientHello：手机传一个字符串，SDK 据此写
+     * MDevice.connectType ——
+     *   "usb"      → 2  全通道走 USB（AUTH/CERT/CMD/CAST_RTSP/CAST_RTP/AUDIO/UIBC/SENSOR
+     *                    经 AOA bulk 多路复用，完全不经 Wi-Fi）
+     *   "wifi_p2p" → 1
+     *   "wifi_ap"  → 3
+     * 所以这一行是判断「USB 到底有没有被用上」的唯一可信依据，比插没插线可靠。
+     */
+    private void logConnectType(String phoneId) {
+        if (connectTypeLogged) return;
+        connectTypeLogged = true;
+        try {
+            if (adapter == null) return;
+            // ★ getConnectType(String) 在查不到设备时**返回 1**（默认值），这会让
+            //   "没查到" 看起来像 "走的是 P2P"。所以先用 getMobileDevice 判断设备是否存在，
+            //   存在才读它的 connectType；会话切换瞬间 phoneId 常是 "-1"，需要用缓存的上一个。
+            String id = phoneId;
+            UCarCommon.MobileDevice dev = adapter.getMobileDevice(id);
+            if (dev == null && lastDeviceId != null) {
+                id = lastDeviceId;
+                dev = adapter.getMobileDevice(id);
+            }
+            if (dev == null) {
+                log("[通道判定] 未找到设备（phoneId=" + phoneId + " lastId=" + lastDeviceId + "），本次不判定");
+                return;
+            }
+            int ct = dev.getConnectType();
+            String name;
+            switch (ct) {
+                case 2:  name = "USB（AOA 全通道）"; break;
+                case 1:  name = "WiFi Direct (P2P)"; break;
+                case 3:  name = "WiFi SoftAP"; break;
+                default: name = "默认/未知"; break;
+            }
+            // 补两项实锤：车机 Wi-Fi 是否开着、有没有 p2p 接口。
+            //   connectType 是手机"声明"的，接口列表是车机"实际"的 —— 两者对不上时，
+            //   以接口为准。有 p2p0 就说明视频真的跑在无线直连上；只有 wlan0/usb0 才是走线。
+            StringBuilder extra = new StringBuilder();
+            try {
+                android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager)
+                        appCtx.getSystemService(android.content.Context.WIFI_SERVICE);
+                extra.append(" wifiEnabled=").append(wm != null && wm.isWifiEnabled());
+            } catch (Throwable ignored) {
+            }
+            try {
+                StringBuilder ifs = new StringBuilder();
+                java.util.Enumeration<java.net.NetworkInterface> en =
+                        java.net.NetworkInterface.getNetworkInterfaces();
+                while (en != null && en.hasMoreElements()) {
+                    java.net.NetworkInterface ni = en.nextElement();
+                    String n = ni.getName();
+                    if (n != null && (n.startsWith("p2p") || n.startsWith("wlan") || n.startsWith("rndis"))) {
+                        ifs.append(n).append(',');
+                    }
+                }
+                extra.append(" ifaces=").append(ifs.length() == 0 ? "(none)" : ifs.toString());
+            } catch (Throwable ignored) {
+            }
+            log("[通道判定] dev=" + id + " connectType=" + ct + " → " + name + " |" + extra);
+        } catch (Throwable t) {
+            log("[通道判定] 读取失败: " + t);
+        }
+    }
+
+    /** 每次会话结束时打一行汇总，四组实验可以在同一份报告里横向对比。 */
+    private void logSessionSummary(String reason) {
+        log("[诊断汇总] " + reason
+                + " | res=" + videoW + "x" + videoH
+                + " fps=" + appliedFps
+                + " 协商90→100=" + (lastSegMs < 0 ? "?" : lastSegMs + "ms")
+                + " 首帧=" + (lastFirstFrameMs < 0
+                        ? "未就绪"
+                        : lastFirstFrameMs + "ms" + (firstFrameFromStart ? "(自startCast)" : ""))
+                + " 结果=" + (surfaceReady ? "正常" : "黑屏"));
+    }
+
+    public void onSurfaceDestroyed() {
+        logSessionSummary("投屏页关闭");
+        this.surface = null;
+        this.surfaceW = -1;
+        this.surfaceH = -1;
+        castStarted = false;
+        surfaceReady = false;
+        castRetry = 0;
+        // 注意：**不重置 handoffPrimed**。
+        //   VideoPlayerV2 挂在 CastManager 上、进程内不销毁，mIsConfigured 一旦为 true
+        //   就一直为 true。此时再空配一次，startCast 会走 setOutputSurface 把画面切到
+        //   离屏 Surface 上 —— 等于把一条本来正常的链路黑一下。所以空配只做一次。
+        primingPhase = false;
+        main.removeCallbacks(surfaceWatchdog);
+        log("Surface 已销毁 → 状态清空");
+    }
+
+    /**
+     * 投屏页通过像素采样确认「画面真的出来了」。
+     *
+     * <p>为什么不直接依赖 {@code onSurfaceReady()}：反编译
+     * {@code VideoPlayerV2$1.onOutputBufferAvailable} 的判定链是
+     * <pre>
+     *   mNeedRender &amp;&amp; !mIsSurfaceAlReady
+     *   &amp;&amp; mLastReadyCountTime != -1
+     *   &amp;&amp; mLastReadyCountTime &gt;= presentationTimeUs
+     * </pre>
+     * 而 {@code mLastReadyCountTime} 只在输入侧「第一帧 且 mLastShownTime == 0」时才赋值。
+     * 这几个条件任一不成立，就会出现<b>画面已经在放、回调却永远不来</b>的情况 ——
+     * 上层于是以为黑屏，白白断掉一个本来正常工作的会话。
+     * 像素采样是唯一不依赖 SDK 内部状态的判据。
+     */
+    public void onPixelsVisible() {
+        if (surfaceReady) return;
+        if (!castStarted) {
+            // 还没开始投屏就采到"非黑"，只可能是上一场会话残留在 SurfaceView buffer 里的
+            // 最后一帧（断开不会清空 buffer）。这种"陈旧画面"不算就绪。
+            return;
+        }
+        if (System.currentTimeMillis() - tStartCast < 600L) {
+            // 同理：刚 startCast 完的这 600ms 里，屏幕上仍是旧帧。留一个下限，
+            // 让采样点一定落在"新会话已经开始灌数据"之后。
+            return;
+        }
+        surfaceReady = true;
+        final long now = System.currentTimeMillis();
+        everSurfaceReady = true;
+        tSurfaceReadyAt = now;
+        firstFrameFromStart = (tProgress100 == 0L);
+        lastFirstFrameMs = firstFrameFromStart ? (now - tStartCast) : (now - tProgress100);
+        main.removeCallbacks(surfaceWatchdog);
+        log("★ 像素采样确认画面已出 —— 距 startCast " + lastFirstFrameMs + "ms"
+                + "（SDK onSurfaceReady 未到，属已知的判定链缺陷）");
+        main.post(listener::onFrameVisible);
+    }
+
+    /**
+     * 从后台回到前台。倒车影像这类系统浮层通常**不销毁** Surface，只是让 buffer 失效，
+     * 回调一个都不来。此时必须主动重建一次投屏会话，否则画面停在被切走前的最后一帧。
+     */
+    public void rebindAfterResume() {
+        if (adapter == null || !sdkReady) return;
+        Surface s = surface;
+        if (s == null || !s.isValid()) {
+            log("onResume：Surface 不可用，等 surfaceCreated 重建");
+            return;
+        }
+        log("onResume：强制重建投屏会话");
+        castStarted = false;
+        surfaceReady = false;
+        castRetry = 0;
+        castRebuildCount = 0;
+        // ★ 必须传 false。反编译 UCarAdapter.pauseCast(Z)：
+        //      mCastManager.pauseCast();
+        //      if (gotoBackground) mWorkerHandler.post(() -> mControlManager.sendGotoBackground());
+        //   无参 pauseCast() 等价于 pauseCast(true)，会**通知手机「车机已切后台」**。
+        //   手机收到后会把投屏应用退回后台甚至停编码 —— 我们要的只是换一次输出面，
+        //   绝不能告诉手机"我退出了"。
+        try {
+            adapter.pauseCast(false);
+        } catch (Throwable t) {
+            log("pauseCast(false) 异常: " + t);
+        }
+        tryStartCast();
+    }
+
     public void setSurface(Surface s, int w, int h) {
         if (s == null) return;
 
@@ -255,11 +661,22 @@ public class IccoaManager {
     // ==================================================================
 
     /** 启动（或重启）投屏链路。权限由调用方（Activity）负责。 */
+    /**
+     * 构建标记。每次编版递增，启动时打一行 —— 这样从日志里就能确认
+     * 「跑的是不是刚才那一版」，不用再靠某个字符串猜。
+     */
+    public static final String BUILD_TAG = "dilinkfix-2026-10-24.22";
+
     public void start() {
+        log("构建标记 " + BUILD_TAG);
         log("=== 启动（ICCOA CarWith）===");
         // 每次开始新会话都重置触控日志预算，否则第一次调试用完 12 条之后，
         // 后续连接里的触摸将完全不留痕迹（曾经因此误判为「事件没到」）。
         touchLogBudget = 12;
+        // 每次新会话重置首屏看门狗：重建次数按「单次连接」计，不能跨会话累计。
+        castRebuildCount = 0;
+        surfaceReady = false;
+        main.removeCallbacks(surfaceWatchdog);
 
         // ★ UCarConfig 只在 init() 时生效一次，而 start() 在「已初始化」时会直接返回。
         //   于是用户改了 Network transport 之后，界面上变了、报告头也变了，但实际会话
@@ -423,7 +840,11 @@ public class IccoaManager {
     public void disconnectSession() {
         log("=== 断开当前会话（保持广播）===");
         if (adapter != null) {
-            try { adapter.pauseCast(); } catch (Throwable t) { log("pauseCast 异常: " + t); }
+            // ★ pauseCast(false)：不向手机下发 "GotoBackground"。
+            //   紧跟着就是 disconnect()，再让手机把投屏应用退回后台毫无意义，
+            //   反而可能让手机进入「被切走」状态、推迟自动重连 —— 而重连正是
+            //   冷启动首场之后恢复画面的唯一路径。
+            try { adapter.pauseCast(false); } catch (Throwable t) { log("pauseCast 异常: " + t); }
             try { adapter.disconnect(); } catch (Throwable t) { log("disconnect 异常: " + t); }
         }
         sessionActive = false;
@@ -441,8 +862,76 @@ public class IccoaManager {
         if (adapter == null) return;
         boolean ok = adapter.startAdvertise();
         log((ok ? "✓ " : "✗ ") + "startAdvertise() = " + ok);
+        if (ok) {
+            // ★ 预热必须排在广播**之后**。
+            //   startCast 与 startAdvertise 都排在 SDK 同一个 worker 线程上；如果先把
+            //   MediaCodec 的 configure 丢进去而它在某些机型上卡住，广播就永远轮不到执行，
+            //   表现出来就是"六位配对码不出来"。
+            schedulePinWatchdog();
+            // ★ 关键时序修正：把「建解码器」提前到**手机连上之前**。
+            //
+            //   逐场对比日志得到的规律，冷启动首场必然失败、第二场必然成功：
+            //     失败场：startCast 在 progress 10~30（手机已经连上、正在协商）
+            //     成功场：startCast 在 progress 0（手机还没连上，解码器已就位）
+            //   差别在于 native sink 已经开推之后才建 VideoPlayerV2 —— 开推瞬间那个
+            //   关键帧没有解码器接，之后手机不再补发 IDR，画面就一直黑到会话结束。
+            //
+            //   所以在广播成功、手机尚未连入的这个窗口，先用同一尺寸的离屏 Surface 把
+            //   VideoPlayerV2 建起来（configure + start 全部落定）。手机连上时它已经在跑，
+            //   后面真实 Surface 到达只需 setOutputSurface。
+            //
+            //   只在「还没空配过」时做一次：VideoPlayerV2 跨会话复用，mIsConfigured 一旦
+            //   为 true 就永久为 true，重复空配只会把输出面来回切，反而多一次黑屏。
+            if (!handoffPrimed) {
+                main.postDelayed(this::primeDecoderOffscreen, 600L);
+            }
+        }
         tryStartCast();
     }
+
+    /** 广播之后延时执行的预热。 */
+    private final Runnable prewarmRunnable = new Runnable() {
+        @Override
+        public void run() {
+            prewarmDecoder();
+        }
+    };
+
+    /**
+     * 配对码看门狗：广播成功后 8 秒还没拿到 onPinCode，就重播一次并留日志。
+     * 目的不是修复，而是让"没有配对码"这件事在日志里立刻可见，而不是全靠肉眼。
+     */
+    private int pinRetryCount = 0;
+
+    private void schedulePinWatchdog() {
+        main.removeCallbacks(pinWatchdog);
+        pinRetryCount = 0;
+        main.postDelayed(pinWatchdog, 8000L);
+    }
+
+    private final Runnable pinWatchdog = new Runnable() {
+        @Override
+        public void run() {
+            if (lastPinCode != null) return;      // 已经有码，正常
+            if (pinRetryCount >= 2) {
+                log("✗ 8s 内两次重播都没有配对码，停止重试（检查蓝牙广播能力）");
+                return;
+            }
+            pinRetryCount++;
+            log("✗ 8s 未收到配对码 → 重新广播（第 " + pinRetryCount + " 次）");
+            try {
+                if (adapter != null) adapter.stopAdvertise();
+            } catch (Throwable ignored) {
+            }
+            main.postDelayed(() -> {
+                if (adapter != null) {
+                    boolean ok = adapter.startAdvertise();
+                    log((ok ? "✓ " : "✗ ") + "重播 startAdvertise() = " + ok);
+                }
+                main.postDelayed(pinWatchdog, 8000L);
+            }, 500L);
+        }
+    };
 
     /**
      * 尝试起投。
@@ -462,15 +951,211 @@ public class IccoaManager {
             return;
         }
         castRetry = 0;
-        boolean ok = adapter.startCast(s, videoW, videoH);
+
+        // ★ 首次投屏：先用「同尺寸离屏 Surface」把 configure 消耗掉，再交接真实 Surface。
+        //   目的见 handoffPrimed 的注释：让首场也走 setOutputSurface，而不是第一次 configure。
+        if (!handoffPrimed) {
+            handoffPrimed = true;
+            if (primeDecoderOffscreen()) {
+                // 空配刚开始 → 等它落定再交接；空配早已完成（本轮常见，Surface 比手机晚到）
+                // → 立即交接。日志里这一步白等了 300ms，正好把真实 Surface 的 startCast
+                // 推到 progress 30，而 progress 0 才是唯一稳定成功的时机。
+                final long elapsed = System.currentTimeMillis() - primeStartedAt;
+                final long wait = elapsed >= PRIME_HANDOFF_DELAY_MS
+                        ? 0L : PRIME_HANDOFF_DELAY_MS - elapsed;
+                if (wait > 0L) {
+                    main.postDelayed(this::castToRealSurface, wait);
+                } else {
+                    castToRealSurface();
+                }
+                return;
+            }
+        }
+        castToRealSurface();
+    }
+
+    /** 真正把画面投到车机屏幕的 Surface 上。 */
+    private void castToRealSurface() {
+        if (!sdkReady || adapter == null || castStarted) return;
+        Surface s = surface;
+        if (s == null || !s.isValid()) {
+            log("交接真实 Surface 时它已失效，等下一次 surfaceChanged");
+            primingPhase = false;
+            // 交接没完成 → 允许下一次重新空配，否则会被永久跳过。
+            handoffPrimed = false;
+            return;
+        }
+        // ★ 防抢跑：日志里空配刚发出 56ms，第二次 surfaceChanged 就把交接提前触发了。
+        //   此时 SDK 的 configure() 还没跑完（它内部是 post 到 worker handler 异步执行的），
+        //   真实 Surface 的 startCast 会再次走 configure 分支 —— 空配等于白做，首场照旧黑。
+        final long elapsed = System.currentTimeMillis() - primeStartedAt;
+        if (primeStartedAt > 0L && elapsed < PRIME_HANDOFF_DELAY_MS) {
+            final long wait = PRIME_HANDOFF_DELAY_MS - elapsed;
+            log("交接被提前触发（" + elapsed + "ms < " + PRIME_HANDOFF_DELAY_MS
+                    + "ms），推迟 " + wait + "ms，等空配的 configure 落定");
+            main.postDelayed(this::castToRealSurface, wait);
+            return;
+        }
+        primingPhase = false;
+        surfaceReady = false;
+        tStartCast = System.currentTimeMillis();
+        // ★ 用带 IAppSurfaceStateListener 的重载：startCast 返回 true 只代表「调用被接收」，
+        //   真正决定有没有画面的是 SDK 后续的 onSurfaceReady()。冷启动第一次连接时，
+        //   解码器/native sink 首次初始化较慢，startCast 返回 true 但迟迟不回调
+        //   onSurfaceReady，表现就是「连上了、进度 100、但黑屏」；退出重连时
+        //   native 已热，回调立刻到达，所以第二次正常。
+        boolean ok;
+        try {
+            ok = adapter.startCast(s, videoW, videoH, surfaceStateListener);
+        } catch (Throwable t) {
+            log("startCast(4 参) 异常，退回 3 参: " + t);
+            ok = adapter.startCast(s, videoW, videoH);
+        }
         castStarted = ok;
         log((ok ? "✓ " : "✗ ") + "startCast(" + videoW + "x" + videoH + ") = " + ok
                 + " surfaceValid=" + s.isValid()
-                + " panel=" + screenW + "x" + screenH);
+                + " panel=" + screenW + "x" + screenH
+                + " progress=" + lastProgress
+                + (lastProgress < 40 ? "（预热：早于媒体协商）" : ""));
         if (ok) {
             main.post(listener::onCastStarted);
+            // 交接完成 → 延后回收空配用的离屏 Surface。留 2 秒是为了避开
+            // MediaCodec 内部切换输出面的过渡窗口（setOutputSurface 之后仍可能有
+            // 一两帧走向旧 Surface）。
+            // 只在「确实已经切到真实 Surface」时才回收：若交接其实没成功（比如
+            // setOutputSurface 抛了异常被 SDK 吞掉），这块离屏 Surface 仍是解码器
+            // 当前的输出面，提前 release 会让整条视频链路直接报错。
+            if (primeSurface != null) {
+                main.postDelayed(() -> {
+                    if (castStarted && !primingPhase) releasePrime();
+                    else log("空配 Surface 保留（交接未确认）");
+                }, 2000L);
+            }
         }
     }
+
+    /** SDK 认为 Surface 可以收画面了才回调；这是唯一可靠的「首屏是否真正就绪」信号。 */
+    private final IAppSurfaceStateListener surfaceStateListener =
+            new IAppSurfaceStateListener() {
+                @Override
+                public void onSurfaceReady() {
+                    // 空配阶段的 Surface 在离屏，它"ready"跟车机屏幕无关，不能当首帧。
+                    if (primingPhase) {
+                        log("（空配阶段 onSurfaceReady，忽略）");
+                        return;
+                    }
+                    final long now = System.currentTimeMillis();
+                    surfaceReady = true;
+                    everSurfaceReady = true;
+                    tSurfaceReadyAt = now;
+                    firstFrameFromStart = (tProgress100 == 0L);
+                    lastFirstFrameMs = firstFrameFromStart
+                            ? (now - tStartCast)
+                            : (now - tProgress100);
+                    main.post(listener::onFirstFrame);
+                    log("★ onSurfaceReady() —— 首帧"
+                            + (firstFrameFromStart ? "（早于 progress100）" : "")
+                            + " 距 progress100 "
+                            + (tProgress100 == 0L ? "n/a" : (now - tProgress100) + "ms")
+                            + "，距 startCast " + (now - tStartCast) + "ms"
+                            + "，当时进度 " + lastProgress);
+                }
+            };
+
+    /**
+     * 首屏看门狗的判定基准，从 1 秒放宽到 4.5 秒。
+     *
+     * <p>原来的 1 秒是「onSurfaceReady 迟到就判死」，但像素采样（{@link #onPixelsVisible()}）
+     * 才是真判据，而像素采样本身有 250ms 的采样周期、还要等解码器出第一个 buffer。
+     * 日志里 progress 100 之后 1.2~2.0 秒才出首帧的样本占多数，1 秒等于直接误杀。
+     */
+    private static final long SURFACE_READY_TIMEOUT_MS = 4500L;
+
+    /**
+     * 冷启动首场（本进程还没出过画面）的等待上限。
+     *
+     * <p>取 900ms，且**从 progress 90 起算**而不是 100。
+     *
+     * <p>依据是实测：健康会话的像素都在 progress 90 之后 206~875ms 内到达；而
+     * progress 90→100 这段协商本身还要 1.8~1.9 秒。等 progress 100 再从零计时，
+     * 等于白白多花这 1.9 秒 —— .18/.19 两轮日志里那 1.2 秒等待其实全落在
+     * 「协商已经走完、画面却不会来」的空档上。
+     */
+    private static final long COLD_START_TIMEOUT_MS = 900L;
+
+    private void scheduleSurfaceWatchdog() {
+        main.removeCallbacks(surfaceWatchdog);
+        main.postDelayed(surfaceWatchdog,
+                everSurfaceReady ? SURFACE_READY_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+    }
+
+    /**
+     * 首屏看门狗。
+     *
+     * <p>判定依据改成「像素是否出过」而不是「onSurfaceReady 是否到过」—— 后者在
+     * {@code mLastReadyCountTime} 等内部状态不满足时会永久缺失，见
+     * {@link #onPixelsVisible()} 的注释。
+     *
+     * <p>处置顺序也改了：先做**不拆会话**的重绑（{@code pauseCast(false)} + 重新 startCast），
+     * 这一步只换输出面，手机端毫无感知；两步都不行才断会话重播。
+     */
+    private final Runnable surfaceWatchdog = new Runnable() {
+        @Override
+        public void run() {
+            if (!castStarted || surfaceReady) return;
+
+            // ★ 冷启动第一场（本进程还没出过画面）：实测这一场手机压根不推视频流。
+            //   证据：第 1 场 4500ms 无像素 → 重绑 → 又 4500ms 仍无；
+            //   而重连后的第 2 场启动时 mIsFirstLaunch 仍为 true，说明第 1 场
+            //   连一个关键帧都没送到解码器。这一场无论换几次输出面都没用。
+            //   所以不再浪费 4.5 秒去做注定无效的重绑，直接快速重连，
+            //   把黑屏/等待时间压到最短。
+            if (!everSurfaceReady) {
+                // 注意这里用 COLD_START_TIMEOUT_MS 而不是 SURFACE_READY_TIMEOUT_MS：
+                // .18 的日志里文案打的是 4500，实际只等了 1200，对不上账。
+                log("✗ " + COLD_START_TIMEOUT_MS + "ms 无像素（本进程首场，手机未推流）"
+                        + " → 直接断会话，+" + COLD_START_RE_ADVERTISE_DELAY_MS + "ms 重播");
+                main.post(listener::onRecovering);
+                try {
+                    disconnectSession();
+                } catch (Throwable t) {
+                    log("disconnectSession 异常: " + t);
+                }
+                scheduleReAdvertise(COLD_START_RE_ADVERTISE_DELAY_MS);
+                return;
+            }
+
+            // 出过画面之后的中途失效：先重绑输出面（不拆会话，手机无感知），
+            // 仍不恢复再断会话。
+            if (castRebuildCount == 0) {
+                castRebuildCount++;
+                log("✗ " + SURFACE_READY_TIMEOUT_MS + "ms 无像素 → 重绑输出面（不动会话）");
+                try {
+                    adapter.pauseCast(false);
+                } catch (Throwable t) {
+                    log("pauseCast(false) 异常: " + t);
+                }
+                // 重绑会让 SDK 走 setOutputSurface 分支，同时重置 mLastReadyCountTime，
+                // 这正是「第二场一律正常」时它经历的状态。
+                castStarted = false;
+                tryStartCast();
+                main.removeCallbacks(surfaceWatchdog);
+                main.postDelayed(surfaceWatchdog, SURFACE_READY_TIMEOUT_MS);
+                return;
+            }
+
+            log("✗ 重绑无效 → 断开会话并保持广播，等待手机重连");
+            main.post(listener::onRecovering);
+            try {
+                disconnectSession();
+            } catch (Throwable t) {
+                log("disconnectSession 异常: " + t);
+            }
+        }
+    };
+
+    /** 冷启动首场失败后重新广播的延时。手机上 Jovi InCar 收到广播到重连约 1~2 秒。 */
+    private static final long COLD_START_RE_ADVERTISE_DELAY_MS = 800L;
 
     // ==================================================================
     // SDK 回调
@@ -480,6 +1165,8 @@ public class IccoaManager {
         @Override
         public void onPinCode(String pinCode, String carDeviceName) {
             lastPinCode = pinCode;
+            main.removeCallbacks(pinWatchdog);
+            pinRetryCount = 0;
             log("★ onPinCode pinCode=" + pinCode + " carDeviceName=" + carDeviceName);
             // 新码下发 → 看门狗重新计时，保证用户拿到完整的有效期去确认，不会刚出码就被重播顶掉。
             scheduleAutoRefresh();
@@ -488,6 +1175,9 @@ public class IccoaManager {
 
         @Override
         public void onConnectStateChanged(String deviceID, int oldState, int newState) {
+            if (deviceID != null && !"-1".equals(deviceID) && !deviceID.isEmpty()) {
+                lastDeviceId = deviceID;
+            }
             // ★ 带上 deviceID。多台手机同时在场时，光看状态码分不清是「同一台在重试」
             //   还是「不同设备在互相顶掉」——这两者的处理方式完全不同。
             log("onConnectStateChanged dev=" + shortId(deviceID)
@@ -507,6 +1197,10 @@ public class IccoaManager {
                 //   改用更长的 CONNECTING_TIMEOUT 兜底，超时才放开。
                 sessionActive = true;
                 main.removeCallbacks(reAdvertiseRunnable);
+                // 新会话开始，首屏看门狗的重建次数必须归零 —— 否则上一轮断开前的
+                // 计数会让这一轮刚开始就直接跳到最后一步。
+                castRebuildCount = 0;
+                surfaceReady = false;
                 scheduleConnectingTimeout();
             } else if (newState == 2 || newState == 3) {
                 // 已连上：撤销任何待执行的重新广播，免得刚连上就被重启广播打断；看门狗也会因此空转。
@@ -517,7 +1211,11 @@ public class IccoaManager {
                 // 10003 / 10004 / 10008 —— SDK 的 handleConnectFailed() 三个失败分支
                 // （分别对应 USB / P2P / SoftAP 建链失败）。这些不是 0/1/2/3 状态，
                 // 落到这里必须清掉会话标记，否则看门狗会一直以为「正在协商」而永不重播。
-                log("✗ 连接失败码 " + newState + " → 交回看门狗，准备重播");
+                String hint = (appliedTransport == 1)
+                        ? "（SoftAP 模式：车机系统热点必须处于开启状态 —— SDK 拿不到 TETHER_PRIVILEGED，"
+                          + "无法自己开热点；如果热点本来就没开，请改用 WiFi Direct）"
+                        : "（P2P 模式：检查车机 Wi-Fi 是否被其它连接占用、手机端是否允许 Wi-Fi Direct）";
+                log("✗ 连接失败码 " + newState + " → 交回看门狗，准备重播 " + hint);
                 sessionActive = false;
                 castStarted = false;
                 cancelConnectingTimeout();
@@ -540,6 +1238,43 @@ public class IccoaManager {
         public void onConnectingProgress(String phoneId, int progress) {
             log("onConnectingProgress " + progress);
             main.post(() -> listener.onProgress(progress));
+            // ★ 协商到 100% 才意味着「会话建完了，接下来应该出画面」。
+            //   实测 onSurfaceReady 通常在 100% 之后 1~3 秒到达；从这一刻开始计时，
+            //   才不会在 progress 90→100 这段本来就慢的协商里误判。
+            final long now = System.currentTimeMillis();
+            // 新会话的首个进度事件有时是 10、有时是 20（取决于手机先报哪一步），
+            // 所以用区间判断；0 不在此列 —— 那是断开，不该把本轮结果清掉。
+            if (progress > 0 && progress <= 20 && tProgress100 > 0L) {
+                // 新一轮会话，清掉上一轮的状态，避免汇总里串数据
+                tProgress90 = 0L;
+                tProgress100 = 0L;
+                tSurfaceReadyAt = 0L;
+                lastSegMs = -1L;
+                lastFirstFrameMs = -1L;
+                firstFrameFromStart = false;
+                surfaceReady = false;   // 否则上一轮成功会污染这一轮的「结果=正常/黑屏」
+                castRetry = 0;
+                connectTypeLogged = false;
+                log("── 新一轮会话开始，诊断计时清零");
+            }
+            lastProgress = progress;
+            if (progress == 90) {
+                tProgress90 = now;
+                // ★ 冷启动首场：从 progress 90 就开始计时。
+                //   90 之后手机才真正开始推流，健康会话的像素在 206~875ms 内到达；
+                //   而 90→100 那段协商还要 1.8 秒。等 100 再计时，等于白等这段。
+                if (!everSurfaceReady) {
+                    scheduleSurfaceWatchdog();
+                }
+            }
+            if (progress >= 100 && tProgress100 == 0L) {
+                tProgress100 = now;
+                lastSegMs = (tProgress90 > 0L) ? (now - tProgress90) : -1L;
+                log("[诊断] 协商末段 90→100 = " + lastSegMs + "ms"
+                        + "（startCast 至今 " + (now - tStartCast) + "ms）");
+                logConnectType(phoneId);
+                scheduleSurfaceWatchdog();
+            }
         }
 
         @Override
@@ -629,6 +1364,7 @@ public class IccoaManager {
         //   骁龙 665 这类平台上 1080p60 编码余量不足，用户可以在设置里降到 30，
         //   不需要为此单独编译一版。
         int fps = clamp(readIntSetting("fps-limit", 60), 15, 60);
+        appliedFps = fps;
         int sw = Math.max(1, screenW), sh = Math.max(1, screenH);
         int vw = Math.max(1, videoW), vh = Math.max(1, videoH);
 
@@ -659,7 +1395,7 @@ public class IccoaManager {
             log("读取 transport 失败，退回 both: " + t);
         }
 
-        return new UCarConfig.Builder()
+        UCarConfig.Builder b = new UCarConfig.Builder()
                 .setCarBrMac(carId)                  // 必须恰好 6 字节
                 .setDpi(dpi)                         // 120..640
                 .setRealDpi(realDpi)                 // 120..640
@@ -669,17 +1405,36 @@ public class IccoaManager {
                 .setVideoDisplayWidth(vw)
                 .setVideoDisplayHeight(vh)
                 .setSupportP2P(useP2p)
-                .setSupportSoftAP(useAp)
-                .setSupportCamera(false)
-                .setSupportHevc(false)
-                .setSupportMic(true)
-                .setUseCustomAudioRecord(false)
-                .setSupportStereoRecord(false)
-                .setSupportLowLatencyDecodingMode(false)
-                .setSupportPOINav(false)
-                .setCcdFilePath("ccd.data")
-                .setSupportedWorkModes(workMode)
-                .build();
+                .setSupportSoftAP(useAp);
+
+        // ★ 只在走 P2P 时才设置 5GHz 信道表。
+        //   这里原来写的是 `useP2p ? {...} : new int[0]`，而在 SoftAP 模式下传空数组，
+        //   SDK 会抛 java.security.InvalidParameterException: channels can't be null，
+        //   整个 buildConfig() 失败 → start() 直接 return → 既不 init 也不广播 →
+        //   界面上连六位配对码都不会出现。
+        //   车机上 transport=0（P2P）所以一直没暴露；换成 Hotspot 的假车机立刻必现。
+        if (useP2p) {
+            //   UNII-1(36-48) + UNII-3(149-161)，全部避开 DFS（雷达检测会瞬断）。
+            b.setAllowed5gChannels(new int[]{36, 40, 44, 48, 149, 153, 157, 161});
+        }
+
+        b.setSupportCamera(false);
+        b.setSupportHevc(false);
+        b.setSupportMic(true);
+        // ★ 低延迟解码模式（真实生效）。这个开关有两层作用：
+        //   ① 反编译 lambda$startCast$25：它作为 Z 参数传给 CastManager.startCast
+        //      → VideoPlayerV2.setFlagWfdPerf()，影响解码/渲染的排队策略；
+        //   ② 它随 GetUCarConfigResponse 上报给手机，手机端据此选低延迟编码档
+        //      （通常意味着更短的 GOP），首帧更近、丢包恢复更快。
+        //   注意：下面不能再出现 setSupportLowLatencyDecodingMode(false) ——
+        //   之前链式写法里重复了一次 false，把这里的 true 覆盖掉了。
+        b.setSupportLowLatencyDecodingMode(true);
+        b.setUseCustomAudioRecord(false);
+        b.setSupportStereoRecord(false);
+        b.setSupportPOINav(false);
+        b.setCcdFilePath("ccd.data");
+        b.setSupportedWorkModes(workMode);
+        return b.build();
     }
 
     private static int clamp(int v, int lo, int hi) {

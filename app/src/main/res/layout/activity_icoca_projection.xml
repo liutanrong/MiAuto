@@ -1,24 +1,72 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  投屏页。
+
+  ★ 层级顺序不能动：
+    1) icoca_surface —— SDK 解码输出面。SurfaceView 默认位于 window 之下。
+    2) icoca_veil    —— 不透明遮罩，盖在 SurfaceView 之上。首帧确认前一直挡着，
+                        用户看到的是品牌过渡页而不是一块黑。
+    3) icoca_disconnect —— 始终最上层，车机可能没有可达的返回键。
+
+  为什么需要第 2 层：SurfaceView 在没有任何 buffer 时呈现纯黑，"首屏黑屏"的观感
+  就来自这里。把黑换成一个有信息的过渡页，建链再慢也不刺眼；而只要像素采样确认
+  画面已出，遮罩立刻淡出。
+-->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@android:color/black">
+    android:background="#0E1116">
 
-    <!-- The ICCOA SDK renders the phone's Miracast stream straight into this surface. -->
+    <!-- The ICCOA SDK renders the phone's stream straight into this surface. -->
     <SurfaceView
         android:id="@+id/icoca_surface"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <TextView
-        android:id="@+id/icoca_hint"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="center"
-        android:text="@string/da_connecting"
-        android:textColor="#CCFFFFFF"
-        android:textSize="20sp"
-        android:visibility="gone" />
+    <LinearLayout
+        android:id="@+id/icoca_veil"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#1B2B47"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:padding="32dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/icoca_veil_brand"
+            android:textColor="#F2FFFFFF"
+            android:textSize="30sp"
+            android:textStyle="bold" />
+
+        <ProgressBar
+            android:layout_width="26dp"
+            android:layout_height="26dp"
+            android:layout_marginTop="18dp"
+            android:indeterminateTint="#8FB3E8" />
+
+        <TextView
+            android:id="@+id/icoca_hint"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:text="@string/da_connecting"
+            android:textColor="#B3FFFFFF"
+            android:textSize="18sp" />
+
+        <!-- 构建号直接印在等待页上：装的是不是新包，一眼就能看出来，
+             不用再去翻日志确认 BUILD_TAG。 -->
+        <TextView
+            android:id="@+id/icoca_build"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="26dp"
+            android:alpha="0.55"
+            android:textColor="#FFFFFF"
+            android:textSize="12sp" />
+
+    </LinearLayout>
 
     <!-- Sits over the mirrored UI on purpose: a head unit may have no reachable Back, so there
          must always be a way out. Kept translucent so it stays out of the way. -->

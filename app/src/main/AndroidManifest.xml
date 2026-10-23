@@ -61,6 +61,10 @@
 
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <!-- 投屏期间持 MulticastLock：ICCOA 的 RTP 可能是组播地址，没有这把锁
+         系统会把组播帧直接丢掉；缺这条权限时 acquire() 会抛 SecurityException，
+         日志里就是「Wi-Fi 锁获取失败 ... CHANGE_WIFI_MULTICAST_STATE」。 -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission

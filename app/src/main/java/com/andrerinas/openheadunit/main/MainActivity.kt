@@ -308,8 +308,36 @@ class MainActivity : BaseActivity() {
                     //   phase == Connected 才打开，就会死锁：
                     //   SDK 停在 80% 等 Surface → 永远不 Connected → 投影页永远不开。
                     //   50% 是「已确定要投、还没进入媒体协商」的位置，此时建 Surface 正好。
+                    // ★ 阈值从 50 降到 10，这是"首连黑屏"的关键。
+                    //
+                    //   日志里稳定的规律：进程启动后的第一次连接从不来 onSurfaceReady
+                    //   （SDK 的回调在 onOutputBufferAvailable 里发，也就是"第一帧解码
+                    //   出来"才算 ready），而断开重连的第二次连接一定正常。
+                    //
+                    //   两次唯一的差别是 startCast 的时机：第一次在 progress 50（
+                    //   onSelectWorkMode 之后，RTSP SETUP 已经在进行），第二次是在
+                    //   重新广播之后、新一轮会话开始之前。反编译 CastManager.startCast
+                    //   可知，首次调用会走 `configureDecoder` 分支：
+                    //     MediaFormat.createVideoFormat(mime, w, h) → codec.configure(surface)
+                    //     → mIsFirstLaunch = true → VideoQueueManager.clearDataIfNeeded()
+                    //   也就是"先建解码器、再把队列清空"。如果这时媒体已经开始下发，
+                    //   第一批帧（含起始关键帧）就被这次 clear 吃掉，之后只能等下一个
+                    //   I 帧 —— 表现为连上了、进度 100、就是没有画面。
+                    //
+                    //   把投屏页提前到 progress 10 打开，等于在 SETUP 之前把解码器配置
+                    //   干净，首批帧到达时 mIsFirstLaunch 已经翻过去，不用再清队列。
+                    //   日志验证点：`startCast` 应早于 `onConnectingProgress 40`。
+                    // ★ 已回退到「配对码页留在主界面」的交互（.22）。
+                    //
+                    //   .21 曾把投屏页提前到「配对码出来」时打开，为了让首场的 startCast
+                    //   落在 progress 0。实测证明这条规律只是相关、不是因果：同一轮里
+                    //   两场 startCast 都在 progress 0，先连的那场照样零像素，重连的那场
+                    //   才出画面 —— 差别是「本进程第几次会话」，不是 startCast 的时机。
+                    //   代价却是每次打开 App 都被直接顶进投屏页，设置和主界面都进不去。
+                    //
+                    //   所以提前打开没有保留价值，恢复成 progress >= 10 才进投屏页。
                     val shouldOpen = icocaState.phase == IcocaBridge.Phase.Connected ||
-                        icocaState.progress >= 50
+                        icocaState.progress >= 10
                     if (shouldOpen) {
                         // Open once per session: without the flag, coming back from the projection
                         // screen would bounce the user straight back into it, with no way out.

@@ -2082,6 +2082,19 @@ class AapService : Service(), UsbReceiver.Listener {
         if (UsbDeviceCompat.isInAccessoryMode(device)) {
             // Device already in AOA mode (re-enumerated after UsbAttachedActivity switched it).
             AppLog.i("USB accessory device attached, connecting.")
+            if (BuildConfig.ICCOA_ONLY) {
+                // ★ 配件归 ICCOA SDK，AA 栈完全不碰。
+                //   日志证据：插上 vivo 后手机确实切到 18D1:2D00（AOA 成功），但紧接着
+                //   AapService 把它当 AA 设备接管 —— Start Aap transport handshake +
+                //   拉起 AapProjectionActivity（全屏 TextureView，1920x1080），
+                //   一秒后握手失败又销毁。这段过程会：
+                //     ① 盖住 ICCOA 的 Surface（用户看到的就是"黑屏"）；
+                //     ② 多开一路解码器抢 665 的算力（卡顿的额外来源）；
+                //     ③ 把 MainActivity 拉到前台，投屏页被顶掉。
+                //   这里只保证权限，让 SDK 的 libusbio 独占设备节点。
+                ensureUsbPermissionOnly(device)
+                return
+            }
             launchMainActivityIfNeeded("USB accessory attach")
             checkAlreadyConnectedUsb(force = true)
         } else {
@@ -2091,6 +2104,24 @@ class AapService : Service(), UsbReceiver.Listener {
             // check after a delay to give UsbAttachedActivity a chance to handle it first.
             val deviceName = UsbDeviceCompat(device).uniqueName
             AppLog.i("Normal USB device attached: $deviceName. Will check auto-connect in ${USB_ATTACH_FALLBACK_DELAY_MS}ms...")
+            // ★ AOA 探测。手机插上时是 MTP 模式（isAndroidDevice 判为 true），会走到这个
+            //   分支，而这条路径原本**没有任何 requestPermission 调用** —— 所以车机屏幕上
+            //   永远不会弹「允许访问设备」，手机也永远不会被切到 accessory(18D1)。
+            //   AOA 的 ACCESSORY_START 必须由 host 在拿到 UsbDevice 权限后才能发，
+            //   这里补上请求，日志能看出系统是否弹窗、用户是否允许。
+            if (BuildConfig.ICCOA_ONLY) {
+                try {
+                    val um = getSystemService(Context.USB_SERVICE) as UsbManager
+                    val has = um.hasPermission(device)
+                    AppLog.i("AOA 探测: hasPermission=$has vid=${device.vendorId} pid=${device.productId}")
+                    if (!has) {
+                        um.requestPermission(device, UsbReceiver.createPermissionPendingIntent(this))
+                        AppLog.i("AOA 探测: 已请求 USB 权限（系统应弹出「允许访问设备」）")
+                    }
+                } catch (t: Throwable) {
+                    AppLog.i("AOA 探测: 请求失败 $t")
+                }
+            }
             launchMainActivityIfNeeded("USB normal attach ($deviceName)")
             serviceScope.launch {
                 delay(USB_ATTACH_FALLBACK_DELAY_MS)
@@ -2127,6 +2158,20 @@ class AapService : Service(), UsbReceiver.Listener {
     }
 
     override fun onUsbPermission(granted: Boolean, connect: Boolean, device: UsbDevice) {
+        // ★ 这一处是最隐蔽的旁路：权限回调里直接 connectUsbWithRetry()，
+        //   完全不经过 checkAlreadyConnectedUsb()，所以前面那些拦截对它无效。
+        //   而日志正好证明它一直在跑：
+        //     AOA 探测: 已请求 USB 权限  →  onUsbPermission(granted=true)
+        //     →  connectUsbWithRetry()  →  Start Aap transport handshake
+        //     →  Handshake: Drained 422894 bytes of stale USB data
+        //   ICCOA 的 USB 通道正是在这里被抢走的。
+        if (BuildConfig.ICCOA_ONLY) {
+            AppLog.i(
+                "ICCOA-only: USB permission result handed to the ICCOA SDK " +
+                    "(granted=$granted, device=${device.deviceName}); AA does not open the accessory"
+            )
+            return
+        }
         if (!UsbDeviceCompat.isAndroidDevice(device)) {
             AppLog.i("Ignoring USB permission callback for non-Android device (VID: ${device.vendorId}): ${device.deviceName}")
             return
@@ -2226,7 +2271,49 @@ class AapService : Service(), UsbReceiver.Listener {
      *              because the user has explicitly plugged in a device. Use `false` (default)
      *              for the startup scan in [onCreate].
      */
+    /**
+     * ICCOA-only 构建里，USB 只做一件事：确保 App 有权限打开该设备，
+     * 剩下的 AOA 切换与数据通道都交给 ICCOA SDK（`libusbio.so`）。
+     */
+    private fun ensureUsbPermissionOnly(device: UsbDevice) {
+        // 走主线程：requestPermission 的失败提示是 Toast，非主线程调用会抛
+        // "Can't toast on a thread that has not called Looper.prepare()" —— 那是直接闪退。
+        val action = Runnable {
+            try {
+                val um = getSystemService(Context.USB_SERVICE) as UsbManager
+                if (!um.hasPermission(device)) {
+                    AppLog.i("ICCOA-only: requesting USB permission for ${UsbDeviceCompat(device).uniqueName}")
+                    // 不走 requestUsbPermission()：它会弹 Toast，而这个路径不需要用户可见提示，
+                    // 系统自己的授权框已经够了。少一个 Toast 就少一条崩溃/干扰来源。
+                    val pi = UsbReceiver.createPermissionPendingIntent(this)
+                    um.requestPermission(device, pi)
+                } else {
+                    AppLog.i("ICCOA-only: accessory permission already granted — left to the ICCOA SDK")
+                }
+            } catch (t: Throwable) {
+                AppLog.w("ICCOA-only: USB permission check failed: ${t.message}")
+            }
+        }
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            action.run()
+        } else {
+            android.os.Handler(android.os.Looper.getMainLooper()).post(action)
+        }
+    }
+
     private fun checkAlreadyConnectedUsb(force: Boolean = false) {
+        if (BuildConfig.ICCOA_ONLY) {
+            try {
+                val um = getSystemService(Context.USB_SERVICE) as UsbManager
+                um.deviceList.values
+                    .filter { UsbDeviceCompat.isAndroidDevice(it) }
+                    .forEach { ensureUsbPermissionOnly(it) }
+                AppLog.i("ICCOA-only: Android Auto USB transport disabled; accessories belong to the ICCOA SDK")
+            } catch (t: Throwable) {
+                AppLog.w("ICCOA-only: USB scan failed: ${t.message}")
+            }
+            return
+        }
         val settings = App.provide(this).settings
         val lastSession = settings.autoConnectLastSession
         val singleUsb = settings.autoConnectSingleUsbDevice
