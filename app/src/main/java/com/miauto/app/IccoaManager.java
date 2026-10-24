@@ -361,6 +361,9 @@ public class IccoaManager {
      * configure 出来的 format 与真实码流差着三个数量级，解码器直接不出帧，这就是
      * 那版预热「执行了但没用」的原因。
      */
+    /** 空配总开关（0.3.13 默认关闭，见 tryStartCast 内注释）。 */
+    private static final boolean PRIME_ENABLED = false;
+
     private boolean handoffPrimed = false;
     private SurfaceTexture primeTexture = null;
     private Surface primeSurface = null;
@@ -1145,7 +1148,7 @@ public class IccoaManager {
             //
             //   只在「还没空配过」时做一次：VideoPlayerV2 跨会话复用，mIsConfigured 一旦
             //   为 true 就永久为 true，重复空配只会把输出面来回切，反而多一次黑屏。
-            if (!handoffPrimed) {
+            if (PRIME_ENABLED && !handoffPrimed) {
                 main.postDelayed(this::primeDecoderOffscreen, 600L);
             }
         }
@@ -1207,9 +1210,14 @@ public class IccoaManager {
         }
         castRetry = 0;
 
-        // ★ 首次投屏：先用「同尺寸离屏 Surface」把 configure 消耗掉，再交接真实 Surface。
-        //   目的见 handoffPrimed 的注释：让首场也走 setOutputSurface，而不是第一次 configure。
-        if (!handoffPrimed) {
+        // ★ 0.3.13：空配整体退役（PRIME_ENABLED=false，代码保留供回退）。
+        //   07:17 两次冷启动实测证明空配是首场黑的直接元凶：setOutputSurface 交接
+        //   不真正生效（帧仍渲染在离屏面，真实屏幕像素恒 0），且 prime 管线把 SDK
+        //   的 surface-ready 内部状态标记掉 —— 视频已初始化、onSurfaceReady 却在
+        //   首场永不回调。而它想防的「首帧被清队列」在现时序下不存在：投屏页在
+        //   progress 10 自动打开，真实 startCast 距第一帧约 5.8s，configure 直接在
+        //   真实 Surface 上完成即可，关键帧无损。
+        if (PRIME_ENABLED && !handoffPrimed) {
             // ★ 0.3.11：空配真正成功才置 handoffPrimed。旧写法先进 true 再试，
             //   primeDecoderOffscreen 失败（如 adapter 未就绪）也不回滚 —— 本进程
             //   后续所有会话都再也补不上空配，首场黑问题被永久保留。

@@ -1,3 +1,16 @@
+# MiAuto 0.3.13 — 2026-10-25
+
+- **Offscreen priming retired — the true culprit of the dead first session.** The 07:17
+  cold starts proved the handoff never really happens: session 1 had the video pipeline
+  initialized yet the real screen stayed at 0 lit pixels (session 2, same phone content,
+  read 14), and priming marked the SDK's internal surface-ready state so onSurfaceReady
+  never fired in the first session; after a disconnect the SDK rebuilds the decoder and
+  session 2 works instantly. The "cleared keyframe queue" that priming was meant to prevent
+  no longer exists — the projection page auto-opens at progress 10, so the real startCast
+  precedes the first frame by ~5.8 s and configure completes directly on the real surface.
+  Now casting goes straight to the real surface; priming code kept behind a flag, default off.
+- Expected: the very first session connects; no second attempt.
+
 # MiAuto 0.3.12 — 2026-10-25
 
 - **First-frame judgment rebuilt: "no pixels = dead" retired, rebind-first.** Logcat from
