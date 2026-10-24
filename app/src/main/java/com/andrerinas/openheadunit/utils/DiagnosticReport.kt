@@ -36,6 +36,16 @@ object DiagnosticReport {
         runCatching { readSdkLogcat().forEach(::accept) }
             .onFailure { accept("[diagnostic] SDK logcat unavailable: ${it.message}") }
 
+        // ★ native 层 UIBC/WFD 日志（0.3.5 新增）。
+        //
+        //   UibcManager.sendTouchEvent 的最后一跳是 SinkNative.onUibcEvent（native 方法，
+        //   实现在 libovmsink.so）。它返回 false 时 Java 层看不到原因，但 native 栈会打
+        //   "uibc->started, connect failed!" / "uibc->event, ECONNRESET, EPIPE!" /
+        //   "send datalen check failed" / "wfd_uibc_capability ..." 这类日志 —— 全部不进
+        //   easylog_ 通道，0.3.4 的报告抓不到。这里按关键词补抓，这是触屏失灵的最后拼图。
+        runCatching { readNativeUibcLogcat().forEach(::accept) }
+            .onFailure { accept("[diagnostic] native uibc logcat unavailable: ${it.message}") }
+
         // ★ 系统崩溃缓冲（0.3.4 新增）。Java 层的 UncaughtExceptionHandler 抓不到
         //   native crash（SinkNative.so / 解码器段错误、tombstone），而这类崩溃
         //   恰恰是「App 看起来自己没了、报告里却什么都没有」的元凶。
@@ -65,6 +75,28 @@ object DiagnosticReport {
         return try {
             process.inputStream.bufferedReader().useLines { input ->
                 input.filter { it.contains("easylog_") }.toList()
+            }
+        } finally {
+            process.destroy()
+        }
+    }
+
+    /**
+     * native 层 UIBC/WFD 日志（libovmsink.so 的 __android_log 输出）。
+     *
+     * 关键词覆盖：uibc（会话建立/发送失败）、ovmsink（库名可能作 tag）、
+     * wfd_uibc_capability（RTSP 协商）、NativeRemoteDisplay。上限 300 行。
+     */
+    private fun readNativeUibcLogcat(): List<String> {
+        val process = ProcessBuilder("logcat", "-d", "-v", "threadtime")
+            .redirectErrorStream(true).start()
+        return try {
+            process.inputStream.bufferedReader().useLines { input ->
+                input.filter { line ->
+                    val lower = line.lowercase()
+                    lower.contains("uibc") || lower.contains("ovmsink") ||
+                        lower.contains("nativeremotedisplay")
+                }.take(300).toList()
             }
         } finally {
             process.destroy()

@@ -70,6 +70,29 @@ class App : Application() {
         // 在 AppLog.init 之后：历史崩溃摘要要能进 DiagnosticJournal，随报告一起导出。
         reportPreviousCrash()
 
+        // ★ libusbio 加载预检（0.3.5 新增）。
+        //
+        //   实测出现过 dlopen failed: libusbio.so has bad ELF magic: 00000000 ——
+        //   安装包在设备存储层损坏（/data/app 里的 so 读出全零），SDK 首次触到 USB
+        //   通道时在主线程抛 UnsatisfiedLinkError 直接崩（21:46 起连崩 9 次）。
+        //   这里抢先加载：失败时立刻落一条明确日志（含修复指引），并给出文件头
+        //   快照佐证是存储损坏而非版本问题。
+        runCatching {
+            System.loadLibrary("usbio")
+            AppLog.i("[USB] libusbio 预检：加载成功")
+        }.onFailure { t ->
+            AppLog.e("[USB] libusbio 加载失败 → USB 通道不可用：$t")
+            runCatching {
+                val f = java.io.File(applicationInfo.nativeLibraryDir, "libusbio.so")
+                if (f.isFile) {
+                    val head = f.inputStream().use { s ->
+                        val b = ByteArray(4); s.read(b); b.joinToString(" ") { "%02x".format(it) }
+                    }
+                    AppLog.e("[USB] libusbio.so 文件头=$head size=${f.length()}（合法 ELF 应为 7f 45 4c 46；全零=存储损坏，请重装 APK）")
+                }
+            }
+        }
+
         if (ConscryptInitializer.isAvailable()) {
             AppLog.i("Conscrypt security provider is active")
         } else if (ConscryptInitializer.isNeededForTls12()) {

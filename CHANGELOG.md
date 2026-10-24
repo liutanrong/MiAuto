@@ -1,3 +1,19 @@
+# MiAuto 0.3.5 — 2026-10-24
+
+- **Native UIBC logs are now in the report.** `UibcManager.sendTouchEvent`'s last hop is
+  `SinkNative.onUibcEvent` — a native method implemented in `libovmsink.so`. When it returns
+  false the Java side can't see why, but the native stack logs `uibc->started, connect failed!`,
+  `uibc->event, ECONNRESET, EPIPE!`, `send datalen check failed` and the negotiated
+  `wfd_uibc_capability` line. None of that matched the `easylog_` filter, so 0.3.4 reports
+  were blind at the exact layer where touch dies. Reports now capture these lines (≤300).
+- **libusbio preload check.** Field evidence: an installed package whose
+  `/data/app/.../libusbio.so` read back as all zeros (`bad ELF magic: 00000000`) crashed on
+  the main thread 9 times in a row at startup. The app now loads the library itself first and
+  logs an explicit diagnosis (file head bytes + reinstall hint) instead of leaving a bare
+  `UnsatisfiedLinkError`.
+- **Build-time ELF verification.** A new `verifyNativeLibsElf` gradle task checks the first
+  4 bytes of every jniLibs `.so` before packaging and fails the build on a bad file.
+
 # MiAuto 0.3.4 — 2026-10-24
 
 - **Touch over USB is no longer silently rejected.** Decompiling `UibcManager.sendTouchEvent`

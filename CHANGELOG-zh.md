@@ -1,3 +1,18 @@
+# MiAuto 0.3.5 — 2026-10-24
+
+- **native 层 UIBC 日志进报告。** `UibcManager.sendTouchEvent` 的最后一跳是
+  `SinkNative.onUibcEvent` —— native 方法，实现在 `libovmsink.so`。它返回 false 时
+  Java 层看不到原因，但 native 栈会打 `uibc->started, connect failed!`、
+  `uibc->event, ECONNRESET, EPIPE!`、`send datalen check failed` 以及协商出的
+  `wfd_uibc_capability` 行 —— 这些全都匹配不上 `easylog_` 过滤器，0.3.4 的报告
+  恰好在触屏死掉的那一层是盲的。现在报告补抓这些行（上限 300）。
+- **libusbio 加载预检。** 实测出现过安装包在设备上损坏：`/data/app/.../libusbio.so`
+  读出全零（`bad ELF magic: 00000000`），主线程启动即崩、连崩 9 次。现在 App 启动时
+  抢先加载该库，失败时打明确诊断（文件头字节 + 重装指引），不再留一个裸的
+  `UnsatisfiedLinkError`。
+- **构建期 ELF 校验。** 新增 `verifyNativeLibsElf` gradle 任务：打包前校验 jniLibs
+  里所有 `.so` 的前 4 字节，坏文件直接 fail build。
+
 # MiAuto 0.3.4 — 2026-10-24
 
 - **USB 下触摸不再被静默拒绝。** 反编译 `UibcManager.sendTouchEvent` 发现三道前置检查；

@@ -87,8 +87,8 @@ android {
         applicationId = "com.miauto.app"
         minSdk = 16
         targetSdk = 36
-        versionCode = 304
-        versionName = "0.3.4"
+        versionCode = 305
+        versionName = "0.3.5"
         setProperty("archivesBaseName", "${applicationId}_${versionName}")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         multiDexEnabled = true
@@ -490,4 +490,40 @@ afterEvaluate {
             "assembleGithubRelease", "assemblePlaystoreRelease"
         )
     }.configureEach { finalizedBy(injectIccoaDex) }
+}
+
+// ★ 构建期 ELF 头校验（0.3.5 新增）。
+//   实测出现过装到设备上的 libusbio.so 读出全零（bad ELF magic: 00000000）导致
+//   启动即崩 9 连。此任务在每个 assemble 之前验证 jniLibs 里所有 .so 的前 4 字节，
+//   坏文件直接 fail build，防止坏库再溜进安装包。
+val verifyNativeLibs = tasks.register("verifyNativeLibsElf") {
+    group = "verification"
+    description = "Fail the build if any jniLibs .so has a bad ELF magic"
+    doLast {
+        val jniDirs = listOf(
+            file("src/main/jniLibs"),
+            file("libs")
+        )
+        var bad = 0
+        jniDirs.filter { it.isDirectory }.forEach { dir ->
+            dir.walkTopDown().filter { it.extension == "so" }.forEach { so ->
+                val head = so.inputStream().use { s ->
+                    val b = ByteArray(4)
+                    val n = s.read(b)
+                    if (n < 4) byteArrayOf() else b
+                }
+                val magic = head.joinToString(" ") { "%02x".format(it) }
+                if (magic != "7f 45 4c 46") {
+                    logger.error("✗ 坏 ELF: ${so.absolutePath} head=[$magic] size=${so.length()}")
+                    bad++
+                }
+            }
+        }
+        if (bad > 0) throw GradleException("verifyNativeLibsElf: $bad 个 .so 的 ELF 头非法（见上方 ✗ 行）")
+        logger.lifecycle("✓ verifyNativeLibsElf: jniLibs 全部 .so ELF 头合法")
+    }
+}
+afterEvaluate {
+    tasks.matching { it.name.startsWith("assemble") && it.name.contains("Debug") || it.name.startsWith("assemble") && it.name.contains("Release") }
+        .configureEach { dependsOn(verifyNativeLibs) }
 }
