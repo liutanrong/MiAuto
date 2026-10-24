@@ -1,3 +1,16 @@
+# MiAuto 0.3.7 — 2026-10-24
+
+- **USB 优先终于生效。** 原实现用 `UsbManager.getAccessoryList()` 判断 —— 它只返回已进入
+  AOA accessory 模式的设备，而手机插上车机时以 MTP 模式枚举成 UsbDevice，判定恒 false，
+  功能从未触发（实测报告里 0 条「USB 优先」日志）。现在检查 UsbDevice 列表；receiver 同时
+  监听 `USB_DEVICE_ATTACHED/DETACHED`；拔出改为 2.5 秒去抖后恢复广播（实测手机插线时
+  USB 会以 1~2 秒间隔 ATTACH/DETACH 抖动）。
+- **通道角标。** 投屏页左上角常显当前数据通道（"USB AOA 有线" / "P2P Wi-Fi 5GHz"，
+  频段经反射 `WifiP2pGroup.getFrequency` 尽力获取）；等待页状态行拼接同一描述。
+- **僵死画面防护。** 投屏期间出现 `dev=-1 → STATE_-1`（SDK 连手机的设备标识都拿不到）
+  且持续 2 秒 → 判定手机端异常离开：断开会话、投屏页自动退出、等待页重新广播，
+  不再把最后一帧冻在屏幕上直到断电。
+
 # MiAuto 0.3.6 — 2026-10-24
 
 - **触屏终于修好 —— 是我们自己的 bug。** 0.3.5 的 native 日志抓取让真实拒绝原因现形：

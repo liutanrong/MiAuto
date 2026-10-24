@@ -68,6 +68,10 @@ class IcocaBridge(context: Context) : IccoaManager.Listener {
         val music: String? = null,
         /** 手机端电话状态（空闲 / 来电 / 通话中）。 */
         val callState: String? = null,
+        /** 当前数据通道的可读描述（"USB AOA 有线" / "P2P Wi-Fi 5GHz"）。0.3.7。 */
+        val transport: String? = null,
+        /** 手机端连接异常丢失（僵死画面防护）。投屏页收到后应退出。0.3.7。 */
+        val linkLost: Boolean = false,
     )
 
     private val _state = MutableStateFlow(State())
@@ -179,7 +183,20 @@ class IcocaBridge(context: Context) : IccoaManager.Listener {
             else -> null
         }
         AppLog.i("ICCOA: connection state $stateCode -> ${phase ?: "(keeping current)"}")
+        if (stateCode in 1..3) {
+            // 新会话开始/协商继续：清掉上一轮的丢链标志（投屏页据此不误退）
+            _state.update { it.copy(linkLost = false) }
+        }
         if (phase != null) updatePhase(phase)
+    }
+
+    override fun onLinkLost() {
+        AppLog.w("ICCOA: link lost — projection page should exit")
+        _state.update { it.copy(linkLost = true) }
+    }
+
+    override fun onTransportLabel(label: String?) {
+        _state.update { it.copy(transport = label) }
     }
 
     override fun onPinCode(pinCode: String?, carDeviceName: String?) {

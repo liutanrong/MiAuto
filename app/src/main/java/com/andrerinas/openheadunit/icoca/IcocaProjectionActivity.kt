@@ -110,6 +110,23 @@ class IcocaProjectionActivity : AppCompatActivity() {
                 bridge.state.collect { state ->
                     val hint = findViewById<android.widget.TextView>(R.id.icoca_hint) ?: return@collect
                     val veil = findViewById<View>(R.id.icoca_veil) ?: return@collect
+
+                    // ★ 僵死画面防护（0.3.7）：手机端连接异常丢失（dev=-1 持续 2s 确认）
+                    //   时 IccoaManager 会断开会话并通知这里。投屏页退出，回等待页重新广播，
+                    //   而不是把最后一帧冻在屏幕上等用户断电。
+                    if (state.linkLost) {
+                        AppLog.w("ICCOA projection: link lost → exit to standby")
+                        finish()
+                        return@collect
+                    }
+
+                    // 通道角标（0.3.7）：USB 有线 / P2P Wi-Fi + 频段。拿到就常显。
+                    val transportTag = findViewById<android.widget.TextView>(R.id.icoca_transport)
+                    if (transportTag != null && !state.transport.isNullOrBlank()) {
+                        transportTag.text = state.transport
+                        transportTag.visibility = View.VISIBLE
+                    }
+
                     // ★ 判据是「画面是否真的出来」，不是 phase。
                     //   phase 会在每次会话重建时被 SDK 的 CONNECTING 改回 Pairing，而
                     //   startCast 不会每次都重发，于是 onCastStarted 也不会再触发 ——

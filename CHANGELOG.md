@@ -1,3 +1,19 @@
+# MiAuto 0.3.7 — 2026-10-24
+
+- **USB priority actually works now.** `isUsbAttached()` used `UsbManager.getAccessoryList()`,
+  which only lists devices already in AOA accessory mode — a phone plugged in enumerates as an
+  MTP `UsbDevice`, so the check was always false and the feature never fired (zero "USB 优先"
+  lines in field logs). Now it checks the `UsbDevice` list; the receiver also listens to
+  `USB_DEVICE_ATTACHED/DETACHED`, and detach triggers a 2.5 s debounced re-advertise (field
+  logs show 1–2 s attach/detach flapping during phone re-enumeration).
+- **Transport badge.** The projection page shows the active data channel ("USB AOA 有线" /
+  "P2P Wi-Fi 5GHz" — band via reflected `WifiP2pGroup.getFrequency`, best-effort) and the
+  standby screen appends it to the status line.
+- **Dead-frame protection.** `dev=-1 → STATE_-1` (the SDK can no longer even identify the
+  phone) held for 2 s while a cast was running is treated as phone-side loss: the session is
+  torn down, the projection page exits, and the standby screen re-advertises — instead of
+  freezing on the last frame until the car powers down.
+
 # MiAuto 0.3.6 — 2026-10-24
 
 - **Touch finally fixed — it was our own bug.** 0.3.5's native-log capture exposed the

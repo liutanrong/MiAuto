@@ -95,6 +95,18 @@ public class IccoaManager {
 
         /** 手机端电话状态（空闲 / 来电 / 通话中）。默认空实现，理由同上。 */
         default void onCallState(String text) { }
+
+        /**
+         * 手机端连接异常丢失（0.3.7 新增，僵死画面防护）。
+         *
+         * <p>SDK 状态机出现 {@code dev=-1 → STATE_-1}（设备标识都拿不到的断链）且
+         * 画面曾经投出——这是"手机端已经不在了"的特征，车机画面会停在最后一帧。
+         * 宿主（投屏页）收到后应退出，让等待页重新广播。
+         */
+        default void onLinkLost() { }
+
+        /** 当前数据通道的可读描述（"USB AOA 有线" / "P2P Wi-Fi 5GHz" 等）。默认空实现。 */
+        default void onTransportLabel(String label) { }
     }
 
     private final Context appCtx;
@@ -163,36 +175,84 @@ public class IccoaManager {
                 @Override
                 public void onReceive(Context context, android.content.Intent intent) {
                     String action = intent == null ? null : intent.getAction();
-                    boolean attached = android.hardware.usb.UsbManager.ACTION_USB_ACCESSORY_ATTACHED
+                    boolean accessory = android.hardware.usb.UsbManager.ACTION_USB_ACCESSORY_ATTACHED
                             .equals(action);
-                    log("USB 配件" + (attached ? "已接入" : "已断开"));
-                    if (!usbPriority || adapter == null) {
-                        return;
-                    }
-                    if (attached) {
-                        if (sessionActive || castStarted) {
-                            // 已经有一条会话在跑，此时停广播也不会切通道，只是让日志更乱。
-                            log("USB 优先：当前会话进行中，不打断（下次插拔或重连时生效）");
-                            return;
-                        }
-                        boolean ok;
-                        try {
-                            ok = adapter.stopAdvertise();
-                        } catch (Throwable t) {
-                            ok = false;
-                        }
-                        log("USB 优先：停止蓝牙广播，只等数据线 " + (ok ? "成功" : "失败"));
-                    } else {
-                        boolean ok;
-                        try {
-                            ok = adapter.startAdvertise();
-                        } catch (Throwable t) {
-                            ok = false;
-                        }
-                        log("USB 优先：配件已拔出，恢复蓝牙广播 " + (ok ? "成功" : "失败"));
+                    boolean deviceAttach = android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED
+                            .equals(action);
+                    boolean deviceDetach = android.hardware.usb.UsbManager.ACTION_USB_DEVICE_DETACHED
+                            .equals(action);
+                    if (accessory || deviceAttach) {
+                        log("USB 接入（" + (accessory ? "accessory" : "device") + "）");
+                        applyUsbPriority(true);
+                    } else if (deviceDetach) {
+                        log("USB 设备已断开");
+                        applyUsbPriority(false);
                     }
                 }
             };
+
+    /**
+     * USB 优先的实际执行（0.3.7 抽出）。
+     *
+     * <p>detach 带 2.5 秒去抖：实测 vivo 插上线后 USB 会在 1~2 秒内 ATTACH/DETACH
+     * 连续抖动（手机端重枚举或线材接触），逐事件恢复广播会让手机在两条通道之间
+     * 反复横跳。延迟恢复、attach 取消恢复，抖动就只表现为一次状态切换。
+     */
+    private void applyUsbPriority(boolean attached) {
+        main.removeCallbacks(usbDetachDebounce);
+        if (!usbPriority || adapter == null) {
+            return;
+        }
+        if (attached) {
+            if (sessionActive || castStarted) {
+                log("USB 优先：当前会话进行中，不打断（下次插拔或重连时生效）");
+                return;
+            }
+            boolean ok;
+            try {
+                ok = adapter.stopAdvertise();
+            } catch (Throwable t) {
+                ok = false;
+            }
+            log("USB 优先：停止蓝牙广播，只等数据线 " + (ok ? "成功" : "失败"));
+        } else {
+            main.postDelayed(usbDetachDebounce, 2500L);
+        }
+    }
+
+    private final Runnable usbDetachDebounce = new Runnable() {
+        @Override
+        public void run() {
+            if (!usbPriority || adapter == null || isUsbAttached()) {
+                return;
+            }
+            if (sessionActive || castStarted) {
+                return;
+            }
+            boolean ok;
+            try {
+                ok = adapter.startAdvertise();
+            } catch (Throwable t) {
+                ok = false;
+            }
+            log("USB 优先：配件已拔出（去抖确认），恢复蓝牙广播 " + (ok ? "成功" : "失败"));
+        }
+    };
+
+    /** 僵死画面防护：2 秒确认窗到期后仍未恢复 → 断开会话并通知投屏页退出。 */
+    private boolean linkLostArmed = false;
+
+    private final Runnable linkLostRunnable = new Runnable() {
+        @Override
+        public void run() {
+            linkLostArmed = false;
+            if (castStarted || sessionActive) {
+                log("✗ 手机端连接丢失（dev=-1 → STATE_-1 持续 2s）→ 断开会话，退出投屏页");
+                try { disconnectSession(); } catch (Throwable t) { log("断开异常: " + t); }
+                try { listener.onLinkLost(); } catch (Throwable t) { /* 忽略 */ }
+            }
+        }
+    };
 
     /** USB 优先的兜底等待：到点还没建链就恢复广播。 */
     private static final long USB_PRIORITY_FALLBACK_MS = 10_000L;
@@ -229,6 +289,10 @@ public class IccoaManager {
             android.content.IntentFilter f = new android.content.IntentFilter();
             f.addAction(android.hardware.usb.UsbManager.ACTION_USB_ACCESSORY_ATTACHED);
             f.addAction(android.hardware.usb.UsbManager.ACTION_USB_ACCESSORY_DETACHED);
+            // ★ 0.3.7：手机插车机时是 UsbDevice（MTP 模式），不进 accessory 事件——
+            //   原先只监听 ACCESSORY_* 等于永远收不到"插上线"这件事。
+            f.addAction(android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED);
+            f.addAction(android.hardware.usb.UsbManager.ACTION_USB_DEVICE_DETACHED);
             appCtx.registerReceiver(usbReceiver, f);
             usbReceiverRegistered = true;
         } catch (Throwable t) {
@@ -673,7 +737,61 @@ public class IccoaManager {
         stats.onFirstFrame();
         log("★ 像素采样确认画面已出 —— 距 startCast " + lastFirstFrameMs + "ms"
                 + "（SDK onSurfaceReady 未到，属已知的判定链缺陷）");
+        resolveTransportLabel();
         main.post(listener::onFrameVisible);
+    }
+
+    /** 当前通道的可读描述（投屏页角标 / 首页状态用）。 */
+    private volatile String transportLabel = null;
+
+    public String getTransportLabel() { return transportLabel; }
+
+    /**
+     * 判定并上报当前数据通道（0.3.7）。
+     *
+     * <p>USB 优先；无线走 P2P 时尝试反射拿组频段（WifiP2pGroup.getFrequency 是
+     * hidden API），拿不到就只报 "P2P Wi-Fi"。
+     */
+    private void resolveTransportLabel() {
+        String label;
+        if (isUsbAttached()) {
+            label = "USB AOA 有线";
+        } else {
+            label = "P2P Wi-Fi";
+            try {
+                android.net.wifi.p2p.WifiP2pManager wm = (android.net.wifi.p2p.WifiP2pManager)
+                        appCtx.getSystemService(Context.WIFI_P2P_SERVICE);
+                if (wm != null) {
+                    android.net.wifi.p2p.WifiP2pManager.Channel ch =
+                            wm.initialize(appCtx, main.getLooper(), null);
+                    wm.requestGroupInfo(ch, group -> {
+                        String l = "P2P Wi-Fi";
+                        if (group != null) {
+                            try {
+                                Object f = group.getClass().getMethod("getFrequency").invoke(group);
+                                int freq = (Integer) f;
+                                if (freq >= 4900) {
+                                    l = "P2P Wi-Fi 5GHz";
+                                } else if (freq > 0) {
+                                    l = "P2P Wi-Fi 2.4GHz";
+                                }
+                            } catch (Throwable ignored) {
+                                // hidden API 被裁剪就退回无频段的描述
+                            }
+                        }
+                        transportLabel = l;
+                        log("[通道] 当前数据通道：" + l);
+                        try { listener.onTransportLabel(l); } catch (Throwable ignored) { }
+                    });
+                    return;
+                }
+            } catch (Throwable ignored) {
+                // P2P 服务不可用 → 保持 "P2P Wi-Fi"
+            }
+        }
+        transportLabel = label;
+        log("[通道] 当前数据通道：" + label);
+        try { listener.onTransportLabel(label); } catch (Throwable ignored) { }
     }
 
     /**
@@ -1329,6 +1447,17 @@ public class IccoaManager {
      * <p>用于把「无线首场必黑」的快速判死限制在无线链路上：USB 走 AOA，首场是正常的，
      * 提前掐断反而会把好会话杀掉。
      */
+    /**
+     * USB 线是否插着（0.3.7 修复）。
+     *
+     * <p>原实现用 {@code UsbManager.getAccessoryList()}，它只返回已进入 AOA accessory
+     * 模式的设备。而手机插上车机时以 MTP 模式枚举（UsbDevice，如 vivo VID 2D95 /
+     * PID 6012），AOA 模式要等手机端切换——所以 accessory 列表**恒为空**，
+     * USB 优先从来没生效过（实测报告里 0 条「USB 优先」日志）。
+     *
+     * <p>现在改为检查 UsbDevice 列表：有设备（即手机）插着就算，无论它当前处于
+     * 哪种 USB 模式。accessory 模式也保留检查，兼容真 AOA 场景。
+     */
     private boolean isUsbAttached() {
         try {
             android.hardware.usb.UsbManager um =
@@ -1336,8 +1465,12 @@ public class IccoaManager {
             if (um == null) {
                 return false;
             }
-            android.hardware.usb.UsbAccessory[] list = um.getAccessoryList();
-            return list != null && list.length > 0;
+            android.hardware.usb.UsbAccessory[] acc = um.getAccessoryList();
+            if (acc != null && acc.length > 0) {
+                return true;
+            }
+            java.util.HashMap<String, android.hardware.usb.UsbDevice> devs = um.getDeviceList();
+            return devs != null && !devs.isEmpty();
         } catch (Throwable t) {
             return false;
         }
@@ -1421,6 +1554,19 @@ public class IccoaManager {
                     scheduleReAdvertise();
                     scheduleAutoRefresh();
                 }
+            }
+            // ★ 僵死画面防护（0.3.7）。特征：deviceID 变成 "-1"（SDK 已经拿不到手机
+            //   的设备标识）且状态机掉回 STATE_-1，而画面曾经投出。这是手机端已经
+            //   异常离开的表现 —— 车机 Surface 会停在最后一帧，看起来像"卡死"。
+            //   加 2 秒确认窗：SDK 状态机里正常的过渡值（CONNECTED -> STATE_-1）
+            //   deviceID 是有效值，不受影响；只有真丢链才走这里。
+            if (castStarted && "-1".equals(deviceID) && newState == -1 && !linkLostArmed) {
+                linkLostArmed = true;
+                main.postDelayed(linkLostRunnable, 2000L);
+            } else if (newState >= 1 && newState <= 3) {
+                // 会话恢复（手机重连/协商继续），撤销待发的丢链判定
+                linkLostArmed = false;
+                main.removeCallbacks(linkLostRunnable);
             }
             final int st = newState;
             main.post(() -> listener.onConnectionState(st));

@@ -85,6 +85,12 @@ class HomeFragment : Fragment() {
         }
         view.findViewById<TextView>(R.id.connection_status)?.text = status
 
+        // 通道标识（0.3.7）：把当前数据通道（USB AOA / P2P Wi-Fi 频段）拼在状态行，
+        // 等待页就能回答"现在走的是哪条路"—— 上一次会话留下的 label 在新通道
+        // 建立前仍然是最接近真实的描述，所以不清空。
+        val statusWithTransport = state.transport?.let { "$status · $it" } ?: status
+        view.findViewById<TextView>(R.id.connection_status)?.text = statusWithTransport
+
         // Null-tolerant lookups: the layout has an orientation-specific variant, and a missing view
         // must never take the standby screen down while it is the only thing the driver can see.
         val code = state.pinCode

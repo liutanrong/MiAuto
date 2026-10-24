@@ -13,6 +13,7 @@
   画面已出，遮罩立刻淡出。
 -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#0E1116">
@@ -67,6 +68,24 @@
             android:textSize="12sp" />
 
     </LinearLayout>
+
+    <!-- 通道角标（0.3.7）：当前数据走的是 USB 有线还是 P2P 无线（含频段）。
+         放在画面左上角常显，遮罩淡出后也能看到。 -->
+    <TextView
+        android:id="@+id/icoca_transport"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:layout_margin="10dp"
+        android:background="#66000000"
+        android:paddingStart="12dp"
+        android:paddingTop="4dp"
+        android:paddingEnd="12dp"
+        android:paddingBottom="4dp"
+        android:textColor="#CCFFFFFF"
+        android:textSize="12sp"
+        android:visibility="gone"
+        tools:text="P2P Wi-Fi 5GHz" />
 
     <!-- 音量提示。车载音量键改动的是车机的媒体流（手机的镜像音频就播在这条流上），
          但按键没有系统 HUD 反馈，所以自己画一个，1 秒后淡出。 -->
