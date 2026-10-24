@@ -1,3 +1,14 @@
+# MiAuto 0.3.9 — 2026-10-24
+
+- **Dead-frame guard no longer kills cold start; projection page enterable again.** Field
+  testing of 0.3.8 exposed two flaws: (1) the normal first-session recovery flow
+  (900 ms no-pixels → quick reconnect) hit the 2 s confirmation window and wrongly exited the
+  page; (2) the `linkLost` flag was never cleared after a successful reconnect (the SDK
+  re-enters via STATE_11, outside the 1..3 clearing condition), so every subsequent open of
+  the projection page exited instantly. Fix: the guard now arms only after this process has
+  actually shown a picture (`everSurfaceReady`); a new negotiation round (progress 1..20)
+  clears `linkLost`; local disconnects cancel any pending verdict.
+
 # MiAuto 0.3.8 — 2026-10-24
 
 - **Dead-frame protection actually fires now.** The 0.3.7 trigger required `deviceID == "-1"`,

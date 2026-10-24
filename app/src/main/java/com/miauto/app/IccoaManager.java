@@ -1068,6 +1068,9 @@ public class IccoaManager {
         sessionActive = false;
         castStarted = false;
         lastPinCode = null;
+        // 本端主动断开不是丢链：撤销待发的僵死判定，避免 2 秒后把投屏页误杀
+        linkLostArmed = false;
+        main.removeCallbacks(linkLostRunnable);
         scheduleReAdvertise();
         scheduleAutoRefresh();
     }
@@ -1565,7 +1568,11 @@ public class IccoaManager {
             //   现改为：只要投屏已开始、状态掉回 -1（无论标识是否还在），就开 2 秒
             //   确认窗；窗口内手机重连/协商推进（state 1..3 或 connecting progress>0）
             //   即撤销。本端主动断开不受影响（disconnectSession 先清 castStarted）。
-            if (castStarted && newState == -1 && !linkLostArmed) {
+            // ★ 僵死画面防护（0.3.8b 收窄）。只在「本进程画面曾经确认出过」之后才武装：
+            //   冻屏的前提是用户看到过画面；首场冷启动的「无像素 → 秒断 → 重播」是
+            //   正常恢复流程（everSurfaceReady=false），绝不能在这里退出投屏页 ——
+            //   否则每次冷启动都会把刚打开的投屏页杀掉，用户永远进不了投屏。
+            if (castStarted && everSurfaceReady && newState == -1 && !linkLostArmed) {
                 linkLostArmed = true;
                 log("· 连接状态掉回 STATE_-1，2 秒内未恢复则退出投屏页（僵死防护）");
                 main.postDelayed(linkLostRunnable, 2000L);

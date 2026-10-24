@@ -215,9 +215,10 @@ class IcocaBridge(context: Context) : IccoaManager.Listener {
         AppLog.i("ICCOA: progress $progress")
         _state.update {
             when {
-                // 新会话开始：先把上一轮的"首帧已出"清掉
+                // 新会话开始：先把上一轮的"首帧已出"清掉，同时清掉上一轮的丢链标志
+                //（否则重连成功后投屏页一打开就因残留的 linkLost=true 立刻退出）
                 // 首个进度事件可能是 10 也可能是 20；0 是断开，不清 castReady
-                progress in 1..20 -> it.copy(progress = progress, castReady = false, phase = Phase.Pairing)
+                progress in 1..20 -> it.copy(progress = progress, castReady = false, phase = Phase.Pairing, linkLost = false)
                 // 协商走完，即使 SDK 之后再发 -1，也不该退回"正在连接"
                 progress >= 100 -> it.copy(progress = progress, phase = Phase.Connected)
                 else -> it.copy(progress = progress)
