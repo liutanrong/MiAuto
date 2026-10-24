@@ -183,6 +183,23 @@ public class IccoaManager {
                             .equals(action);
                     if (accessory || deviceAttach) {
                         log("USB 接入（" + (accessory ? "accessory" : "device") + "）");
+                        // 0.3.11：isUsbAttached() 把任何 UsbDevice 都算「手机插线」，
+                        // U 盘/行车记录仪也会关掉秒断。把 VID:PID 打出来便于排除干扰项。
+                        try {
+                            android.hardware.usb.UsbManager um = (android.hardware.usb.UsbManager)
+                                    appCtx.getSystemService(Context.USB_SERVICE);
+                            java.util.HashMap<String, android.hardware.usb.UsbDevice> devs =
+                                    um == null ? null : um.getDeviceList();
+                            StringBuilder sb = new StringBuilder();
+                            if (devs != null) {
+                                for (android.hardware.usb.UsbDevice d : devs.values()) {
+                                    sb.append(String.format("%04X:%04X(%s) ",
+                                            d.getVendorId(), d.getProductId(), d.getProductName()));
+                                }
+                            }
+                            log("USB 设备列表: " + (sb.length() == 0 ? "(空)" : sb.toString().trim()));
+                        } catch (Throwable ignored) {
+                        }
                         applyUsbPriority(true);
                     } else if (deviceDetach) {
                         log("USB 设备已断开");
@@ -465,7 +482,9 @@ public class IccoaManager {
     private static final long CONNECTING_TIMEOUT_MS = 45_000L;
 
     private final Runnable connectingTimeoutRunnable = () -> {
-        if (!sessionActive || castStarted) return;
+        // ★ 0.3.11：castStarted 不再短路。起投后协商卡住（progress<90）的场景以前
+        //   没有任何计时器，黑屏可无限持续；只要画面没确认过就允许超时救援。
+        if (!sessionActive || surfaceReady) return;
         log("★ 协商超时（" + (CONNECTING_TIMEOUT_MS / 1000) + " 秒未建立连接）→ 强制重播");
         sessionActive = false;
         reAdvertise();
@@ -546,6 +565,13 @@ public class IccoaManager {
      */
     private boolean primeDecoderOffscreen() {
         if (adapter == null) return false;
+        // ★ 0.3.11：真实投屏已在进行时绝不做空配 —— 否则 startCast(primeSurface) 会把
+        //   解码器输出面切到离屏，车机画面瞬间黑掉（doAdvertise 的 +600ms 延迟任务
+        //   就可能撞上这个窗口）。
+        if (castStarted) {
+            log("空配跳过：真实投屏已在进行（避免抢走输出面）");
+            return false;
+        }
         try {
             if (primeSurface != null) return true;   // 已备好，直接交接
             primeTexture = new SurfaceTexture(false);
@@ -694,6 +720,7 @@ public class IccoaManager {
         //   离屏 Surface 上 —— 等于把一条本来正常的链路黑一下。所以空配只做一次。
         primingPhase = false;
         cancelEarlyBail();
+        cancelCastStallWatchdog();
         logCapabilities();
         cancelGpsTick();
         main.removeCallbacks(surfaceWatchdog);
@@ -731,6 +758,7 @@ public class IccoaManager {
         final long now = System.currentTimeMillis();
         everSurfaceReady = true;
         tSurfaceReadyAt = now;
+        cancelCastStallWatchdog();
         firstFrameFromStart = (tProgress100 == 0L);
         lastFirstFrameMs = firstFrameFromStart ? (now - tStartCast) : (now - tProgress100);
         main.removeCallbacks(surfaceWatchdog);
@@ -1071,6 +1099,7 @@ public class IccoaManager {
         // 本端主动断开不是丢链：撤销待发的僵死判定，避免 2 秒后把投屏页误杀
         linkLostArmed = false;
         main.removeCallbacks(linkLostRunnable);
+        cancelCastStallWatchdog();
         scheduleReAdvertise();
         scheduleAutoRefresh();
     }
@@ -1181,8 +1210,11 @@ public class IccoaManager {
         // ★ 首次投屏：先用「同尺寸离屏 Surface」把 configure 消耗掉，再交接真实 Surface。
         //   目的见 handoffPrimed 的注释：让首场也走 setOutputSurface，而不是第一次 configure。
         if (!handoffPrimed) {
-            handoffPrimed = true;
+            // ★ 0.3.11：空配真正成功才置 handoffPrimed。旧写法先进 true 再试，
+            //   primeDecoderOffscreen 失败（如 adapter 未就绪）也不回滚 —— 本进程
+            //   后续所有会话都再也补不上空配，首场黑问题被永久保留。
             if (primeDecoderOffscreen()) {
+                handoffPrimed = true;
                 // 空配刚开始 → 等它落定再交接；空配早已完成（本轮常见，Surface 比手机晚到）
                 // → 立即交接。日志里这一步白等了 300ms，正好把真实 Surface 的 startCast
                 // 推到 progress 30，而 progress 0 才是唯一稳定成功的时机。
@@ -1242,6 +1274,7 @@ public class IccoaManager {
         castStarted = ok;
         if (ok) {
             startGpsTick();
+            scheduleCastStallWatchdog();   // ★ 0.3.11：起投后 12s 无画面的兜底
             // USB（AOA）会话下 onWfdSinkReady 不触发，source size 停在 0，
             // 触摸会被 SDK 全拒；这里主动补一次（无线会话下补成 display 尺寸
             // 同样无害，且能消除手机上报源尺寸与画布不一致造成的错位）。
@@ -1283,6 +1316,7 @@ public class IccoaManager {
                     surfaceReady = true;
                     everSurfaceReady = true;
                     tSurfaceReadyAt = now;
+                    cancelCastStallWatchdog();
                     firstFrameFromStart = (tProgress100 == 0L);
                     lastFirstFrameMs = firstFrameFromStart
                             ? (now - tStartCast)
@@ -1320,7 +1354,7 @@ public class IccoaManager {
      * 等于白白多花这 1.9 秒 —— .18/.19 两轮日志里那 1.2 秒等待其实全落在
      * 「协商已经走完、画面却不会来」的空档上。
      */
-    private static final long COLD_START_TIMEOUT_MS = 900L;
+    private static final long COLD_START_TIMEOUT_MS = 1300L;
 
     /**
      * USB 链路的冷启动等待。
@@ -1409,6 +1443,39 @@ public class IccoaManager {
             }
         }
     };
+
+    /**
+     * 起投兜底看门狗（0.3.11）。首屏看门狗只在 progress 90/100 时排程，秒断只认
+     * progress 10~20 —— 若协商卡在 30~80，起投后没有任何计时器，黑屏可以无限持续。
+     * 这里的职责简单粗暴：startCast 成功后 12 秒内没确认过画面，就断会话重播。
+     */
+    private static final long CAST_STALL_TIMEOUT_MS = 12_000L;
+
+    private final Runnable castStallWatchdog = new Runnable() {
+        @Override
+        public void run() {
+            if (!castStarted || surfaceReady) return;
+            log("✗ 起投 " + (CAST_STALL_TIMEOUT_MS / 1000) + "s 仍无画面"
+                    + "（协商可能卡在中途，lastProgress=" + lastProgress + "）→ 断会话重播");
+            main.post(listener::onRecovering);
+            stats.reconnectCount++;
+            try {
+                disconnectSession();
+            } catch (Throwable t) {
+                log("disconnectSession 异常: " + t);
+            }
+            scheduleReAdvertise(COLD_START_RE_ADVERTISE_DELAY_MS);
+        }
+    };
+
+    private void scheduleCastStallWatchdog() {
+        main.removeCallbacks(castStallWatchdog);
+        main.postDelayed(castStallWatchdog, CAST_STALL_TIMEOUT_MS);
+    }
+
+    private void cancelCastStallWatchdog() {
+        main.removeCallbacks(castStallWatchdog);
+    }
 
     /** 冷启动首场失败后重新广播的延时。手机上 Jovi InCar 收到广播到重连约 1~2 秒。 */
     private static final long COLD_START_RE_ADVERTISE_DELAY_MS = 800L;
@@ -1629,8 +1696,15 @@ public class IccoaManager {
             //
             //   ★★ 但**只在无线链路上**做。USB（AOA）是另一条通路，实测首场就能出画面，
             //   在 700ms 处掐断会把一条本来正常的会话杀掉 —— 所以只要挂着 USB 配件就不秒断。
-            if (EARLY_BAIL_ENABLED && progress == 10 && !everSurfaceReady
-                    && !earlyBailArmed && castStarted) {
+            // ★ 0.3.11 两个改动：
+            //   ① 触发窗口 10 → 10..20。实测首个进度事件有时是 10 有时是 20，
+            //      只认 ==10 的场次完全跳过秒断。
+            //   ② 空配成功（handoffPrimed）时不再秒断。秒断的前提「首场解码器没预热、
+            //      手机必不推流」只在旧版本成立；离屏空配后首场完全可能出画面，
+            //      700ms 掐死它就是「重建 3 轮才连上」的直接原因。交回冷启动
+            //      看门狗（progress 90 + 1300ms）按像素判据裁决。
+            if (EARLY_BAIL_ENABLED && progress >= 10 && progress <= 20 && !handoffPrimed
+                    && !everSurfaceReady && !earlyBailArmed && castStarted) {
                 if (isUsbAttached()) {
                     // USB 首连也是慢，但「慢」不等于「不出」：实测它能出画面，只是首帧晚。
                     // 掐断会给手机一次额外的 AOA 重协商，反而更慢，所以这里只放宽看门狗。

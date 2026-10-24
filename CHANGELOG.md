@@ -1,3 +1,26 @@
+# MiAuto 0.3.11 — 2026-10-25
+
+- **First connect no longer needs 3 attempts.** The 700 ms early-bail assumed the old
+  world where the decoder was never pre-warmed and the phone never streamed on the first
+  session. With offscreen priming that premise no longer holds, yet the bail still killed
+  every first session unconditionally. Now: when priming succeeded, the bail is skipped and
+  the cold-start watchdog (progress 90 + 1300 ms) judges by actual pixels; the bail remains
+  only as a fallback when priming failed, with its trigger widened to progress 10..20.
+- **Close the "stuck below progress 90 = no timer at all" hole.** The surface watchdog is
+  only scheduled at progress 90/100, the bail only fires at 10..20, and the 45 s connecting
+  timeout used to short-circuit on castStarted — a session stuck at 30..80 after startCast
+  could stay black forever. New 12 s cast-stall watchdog: if no frame is confirmed within
+  12 s of startCast, tear down and re-advertise; the 45 s timeout now gates on surfaceReady.
+- **Priming can be retried**: handoffPrimed is set only after the offscreen prime actually
+  succeeded (previously set before attempting and never rolled back on failure).
+- **Priming no longer steals the real output surface**: skipped when a real cast is already
+  running (the +600 ms delayed prime in doAdvertise could otherwise switch the decoder
+  output off-screen mid-session).
+- Cold-start watchdog 900 ms → 1300 ms: the pixel path needs ≥600 ms after startCast plus a
+  250 ms sampling period; the old window mis-killed late-starting sessions.
+- USB attach now logs device VID:PID list: isUsbAttached() treats any UsbDevice as "phone
+  plugged in", so a USB stick or dashcam also disables the bail — evidence first.
+
 # MiAuto 0.3.10 — 2026-10-24
 
 - **End the "connected for 2 s then killed" loop.** The SDK always fires a transitional
