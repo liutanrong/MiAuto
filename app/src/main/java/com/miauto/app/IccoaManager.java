@@ -140,6 +140,12 @@ public class IccoaManager {
     private final IccoaSessionStats stats = new IccoaSessionStats();
     /** 触控映射与节流。 */
     private final IccoaTouch touch = new IccoaTouch();
+    /**
+     * 每次会话「触摸被拒 → 懒补 → 重发」的次数预算。
+     * 反射调用有成本，且被拒往往意味着整个会话的 source size 都没初始化，
+     * 补一次就够；给 3 次是防万一某次反射执行失败。
+     */
+    private int uibcFixBudget = 3;
     /** USB 优先：插着配件时停掉蓝牙广播，让手机只能走 AOA。 */
     private boolean usbPriority = true;
     private boolean usbReceiverRegistered = false;
@@ -757,6 +763,7 @@ public class IccoaManager {
         // 每次开始新会话都重置触控日志预算，否则第一次调试用完 12 条之后，
         // 后续连接里的触摸将完全不留痕迹（曾经因此误判为「事件没到」）。
         touch.resetLogBudget();
+        uibcFixBudget = 3;
         stats.resetForNewSession();
         musicLogBudget = 6;
         carLinkEnabled = IccoaPrefs.getBool(appCtx, IccoaPrefs.KEY_CAR_LINK, true);
@@ -1114,6 +1121,10 @@ public class IccoaManager {
         castStarted = ok;
         if (ok) {
             startGpsTick();
+            // USB（AOA）会话下 onWfdSinkReady 不触发，source size 停在 0，
+            // 触摸会被 SDK 全拒；这里主动补一次（无线会话下补成 display 尺寸
+            // 同样无害，且能消除手机上报源尺寸与画布不一致造成的错位）。
+            ensureUibcSourceSize("startCast");
         }
         log((ok ? "✓ " : "✗ ") + "startCast(" + videoW + "x" + videoH + ") = " + ok
                 + " surfaceValid=" + s.isValid()
@@ -1799,10 +1810,45 @@ public class IccoaManager {
                         + " p0=(" + touch.xs()[0] + "," + touch.ys()[0] + ")"
                         + " → " + (ok ? "已发送" : "被拒"));
             }
+            if (!ok && uibcFixBudget > 0) {
+                // 被拒 = SDK 的前置检查没过（encryption / source size，反编译见
+                // docs §8）。先打一份内部状态快照，再懒补一次并重发这个事件。
+                // 预算制：每次会话最多补 3 次，不会每次触摸都反射。
+                uibcFixBudget--;
+                log("[UIBC] 被拒快照 " + IccoaUibcFix.snapshot(adapter));
+                ensureUibcSourceSize("touch-rejected");
+                boolean retry = adapter.sendTouchEvent(action, count,
+                        touch.ids(), touch.xs(), touch.ys());
+                log("[UIBC] 懒补后重发 → " + (retry ? "已发送" : "仍被拒")
+                        + " | " + IccoaUibcFix.snapshot(adapter));
+            }
         } catch (Throwable t) {
             if (touch.takeLogSlot()) {
                 log("sendTouchEvent 异常: " + t);
             }
+        }
+    }
+
+    /**
+     * 把 SDK 的 UIBC source size 反射补成 display 尺寸（videoW × videoH）。
+     *
+     * <p>两种触发场景：
+     * <ul>
+     *   <li>USB（AOA）会话：{@code onWfdSinkReady} 不触发，source 停在 0，
+     *       不补则每一刀都被拒；</li>
+     *   <li>无线会话：手机上报的源尺寸若与视频画布不一致，坐标会按
+     *       {@code x * displayW / sourceW} 错位，补成相等即恢复 1:1。</li>
+     * </ul>
+     * 全部 try-catch：反射失败只损失懒补与诊断，不影响投屏。
+     */
+    private void ensureUibcSourceSize(String why) {
+        try {
+            boolean ok = IccoaUibcFix.ensureSourceSize(adapter, videoW, videoH);
+            log("[UIBC] 懒补 source → " + videoW + "x" + videoH
+                    + " (" + why + ") = " + (ok ? "已执行" : "反射不可用"));
+            log("[UIBC] 快照 " + IccoaUibcFix.snapshot(adapter));
+        } catch (Throwable t) {
+            log("[UIBC] 懒补异常: " + t);
         }
     }
 
@@ -1831,6 +1877,9 @@ public class IccoaManager {
                 + " 秒断=" + (EARLY_BAIL_ENABLED ? "开" : "关")
                 + " USB优先=" + (usbPriority ? "开" : "关")
                 + " | USB配件=" + (isUsbAttached() ? "已连接" : "未连接"));
+        // UIBC 内部状态快照（反射读 SDK 的 UibcManager）：source=0x0 就是
+        // 「触摸必然全被拒」的直接证据，省得下次再从行为反推。
+        log("[能力] UIBC " + IccoaUibcFix.snapshot(adapter));
     }
 
     /** P2 能力是否启用（设置项 iccoa-carlink）。 */

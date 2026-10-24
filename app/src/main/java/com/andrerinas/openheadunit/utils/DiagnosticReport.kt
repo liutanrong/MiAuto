@@ -35,6 +35,14 @@ object DiagnosticReport {
         //   避免与 journal 里的 OPENHU 记录重复。
         runCatching { readSdkLogcat().forEach(::accept) }
             .onFailure { accept("[diagnostic] SDK logcat unavailable: ${it.message}") }
+
+        // ★ 系统崩溃缓冲（0.3.4 新增）。Java 层的 UncaughtExceptionHandler 抓不到
+        //   native crash（SinkNative.so / 解码器段错误、tombstone），而这类崩溃
+        //   恰恰是「App 看起来自己没了、报告里却什么都没有」的元凶。
+        //   logcat -b crash 是系统级环形缓冲，进程死了记录也在，runCatching 兜底
+        //   权限/参数不支持的情况。
+        runCatching { readCrashBuffer().forEach(::accept) }
+            .onFailure { accept("[diagnostic] crash logcat unavailable: ${it.message}") }
         return buildString {
             appendLine("DiAuto ${context.packageManager.getPackageInfo(context.packageName, 0).versionName} · diagnostic report")
             appendLine("Android=${Build.VERSION.RELEASE}; API=${Build.VERSION.SDK_INT}")
@@ -57,6 +65,28 @@ object DiagnosticReport {
         return try {
             process.inputStream.bufferedReader().useLines { input ->
                 input.filter { it.contains("easylog_") }.toList()
+            }
+        } finally {
+            process.destroy()
+        }
+    }
+
+    /**
+     * 系统崩溃缓冲：Java handler 抓不到的 native crash / tombstone 在这里。
+     *
+     * 过滤条件放宽到「本进程相关」：包名、进程名、以及崩溃缓冲里必然出现的
+     * FATAL/tombstone/signal 关键字。返回行数上限 200，防止缓冲里堆积的
+     * 历史崩溃把报告主体冲掉。
+     */
+    private fun readCrashBuffer(): List<String> {
+        val process = ProcessBuilder("logcat", "-b", "crash", "-d", "-v", "threadtime")
+            .redirectErrorStream(true).start()
+        return try {
+            process.inputStream.bufferedReader().useLines { input ->
+                input.filter { line ->
+                    line.contains("FATAL") || line.contains("tombstone") ||
+                        line.contains("signal ") || line.contains("miauto", ignoreCase = true)
+                }.take(200).toList()
             }
         } finally {
             process.destroy()

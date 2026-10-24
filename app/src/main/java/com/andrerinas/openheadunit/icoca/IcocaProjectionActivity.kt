@@ -177,6 +177,9 @@ class IcocaProjectionActivity : AppCompatActivity() {
         android.view.KeyEvent.KEYCODE_VOLUME_MUTE,
     )
 
+    /** MulticastLock 失败只提示一次（缺权限是常态，刷屏会挤占报告预算）。 */
+    private var multicastWarned = false
+
     private fun audioManager(): android.media.AudioManager? =
         getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
 
@@ -194,22 +197,29 @@ class IcocaProjectionActivity : AppCompatActivity() {
             return true
         }
         val am = audioManager() ?: return true
-        when (e.keyCode) {
-            android.view.KeyEvent.KEYCODE_VOLUME_UP ->
-                am.adjustStreamVolume(
-                    android.media.AudioManager.STREAM_MUSIC,
-                    android.media.AudioManager.ADJUST_RAISE, 0
-                )
-            android.view.KeyEvent.KEYCODE_VOLUME_DOWN ->
-                am.adjustStreamVolume(
-                    android.media.AudioManager.STREAM_MUSIC,
-                    android.media.AudioManager.ADJUST_LOWER, 0
-                )
-            android.view.KeyEvent.KEYCODE_VOLUME_MUTE ->
-                am.adjustStreamVolume(
-                    android.media.AudioManager.STREAM_MUSIC,
-                    android.media.AudioManager.ADJUST_TOGGLE_MUTE, 0
-                )
+        // adjustStreamVolume 在极少数定制 ROM 上会抛 SecurityException
+        // （DND/勿扰模式锁定音量），按键处理在 dispatchKeyEvent 里，
+        // 异常直接冒出去会把 Activity 搞崩 —— 兜住，最坏是音量键没反应。
+        try {
+            when (e.keyCode) {
+                android.view.KeyEvent.KEYCODE_VOLUME_UP ->
+                    am.adjustStreamVolume(
+                        android.media.AudioManager.STREAM_MUSIC,
+                        android.media.AudioManager.ADJUST_RAISE, 0
+                    )
+                android.view.KeyEvent.KEYCODE_VOLUME_DOWN ->
+                    am.adjustStreamVolume(
+                        android.media.AudioManager.STREAM_MUSIC,
+                        android.media.AudioManager.ADJUST_LOWER, 0
+                    )
+                android.view.KeyEvent.KEYCODE_VOLUME_MUTE ->
+                    am.adjustStreamVolume(
+                        android.media.AudioManager.STREAM_MUSIC,
+                        android.media.AudioManager.ADJUST_TOGGLE_MUTE, 0
+                    )
+            }
+        } catch (t: Throwable) {
+            AppLog.w("ICCOA: 音量调节失败 $t")
         }
         showVolumeOverlay(am)
         return true
@@ -404,7 +414,13 @@ class IcocaProjectionActivity : AppCompatActivity() {
                 }
                 AppLog.i("ICCOA: MulticastLock 已获取")
             } catch (t: Throwable) {
-                AppLog.i("ICCOA: MulticastLock 获取失败 $t")
+                // 缺 CHANGE_WIFI_MULTICAST_STATE 是这台车机的常态（系统应用级权限，
+                // manifest 里声明了也拿不到）。原先每次进投屏页都刷一条 ERROR，
+                // 既没用又挤占诊断报告的 6000 行预算 —— 本进程只记一次。
+                if (!multicastWarned) {
+                    multicastWarned = true
+                    AppLog.w("ICCOA: MulticastLock 获取失败 $t（后续不再重复）")
+                }
             }
         }
     }

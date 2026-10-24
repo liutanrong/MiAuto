@@ -307,6 +307,57 @@ boolean sendTouchEvent(int action, int count, int[] trackIds, int[] xs, int[] ys
 触控回传 action=0 count=1 view=2298x1080 video=1280x592 p0=(56,552) → 已发送
 ```
 
+### 8.1 0.3.4 反编译：`UibcManager` 的三道前置检查与 source size 之谜
+
+`UCarAdapter.sendTouchEvent` 只是个壳，实现在 `com.ucar.vehiclesdk.control.UibcManager`
+（`icar-sdk.dex` 反汇编，0.3.4 开发期间完成）。按检查顺序：
+
+| # | 检查 | 失败日志 | 赋值来源 |
+|---|---|---|---|
+| 1 | `trackIds/xs/ys` 长度都等于 `count` | `sendTouchEvent failed: count error!` | — |
+| 2 | `mIsEncryptionSettled == true` | `sendTouchEvent failed: encryption is not settled` | `onWfdSinkReady` → `setEncryption(uibcEncryption)` |
+| 3 | `mSourceWidth/Height > 0` | `sendTouchEvent failed: source size haven't been initialized!` | `onWfdSinkReady` → `updateVideoSourceSize(w, h)` |
+
+赋值链唯一且窄：
+
+```
+SinkNative/native → CastManager$1.onCastVideoInitialized(mime, sessionId, 源宽, 源高)
+  → CastListener.onWfdSinkReady(sessionId, mVideoSourceWidth, mVideoSourceHeight, mIsUibcEncryption)
+    → UibcManager.setSessionID + setEncryption + UCarAdapter.updateVideoSourceSize(w, h)
+```
+
+而 `CastListener` 只有三个回调（`onWfdAudioInitialized` / `onWfdSinkReady` /
+`onWfdSinkStopped`），**全是 WFD（Wi-Fi Display）语义**。AOA（USB）传输下媒体走另一条路，
+`onCastVideoInitialized` 不触发 → source size 停在 0 → 触摸全被拒。方控
+`sendKeyEvent` 走同一 `SinkNative.onUibcEvent` 出口、同样查 encryption，但**不查
+source size**，所以按键不受影响 —— 这就是实测里「触摸全被拒、方控照常」的成因。
+
+坐标公式（`getTouchCoordinateX/Y`）：
+
+```java
+mappedX = (int)(x * 1.0f * mDisplayWidth  / mSourceWidth);
+mappedY = (int)(y * 1.0f * mDisplayHeight / mSourceHeight);
+```
+
+`mDisplayWidth/Height` 是 `startCast` 时由车机传入的 videoW/videoH；本项目的 `xs[]`
+正是按这个基准归一化的。因此 **source 与 display 相等时映射 1:1**；若手机上报的源尺寸
+与视频画布不一致（例如上报竖屏尺寸），坐标会按比例错位。0.3.4 的懒补
+（反射 `UCarAdapter.updateVideoSourceSize(videoW, videoH)`，见 `IccoaUibcFix.java`）
+同时解决两件事：USB 下补上缺失值、无线下强制 1:1。
+
+> 另：`sendTouchEvent` 组包的 JSON 里 `width/height` 取 `mDisplayWidth/Height`，
+> `x/y` 取映射后的值，`origin point / display size / source size / mapped point`
+> 会以 d 级日志整条打出（tag `easylog_UibcManager`，走 EasyLog 文件通道，**不进
+> logcat**，诊断报告抓不到 —— 这也是项目自己反射读字段打快照的原因）。
+
+### 8.2 崩溃可见性（0.3.4）
+
+- EasyLog（tag `easylog_*`）实测**完全不进 logcat**，`logcat -d` 与 `logcat -b crash`
+  都抓不到 SDK 自己的行；诊断报告里的 SDK 段实际上条数为 0，真正可用的只有
+  AppLog/DiagnosticJournal（tag `OPENHU`）。
+- 因此 0.3.4 起：未捕获异常写 `crash-<ts>.txt`（保留 5 份）并在下次启动时把摘要注入
+  AppLog；报告增加 `logcat -b crash` 抓取，覆盖 Java handler 看不到的 native crash。
+
 ---
 
 ## 9. 五轮实测：首场为什么黑

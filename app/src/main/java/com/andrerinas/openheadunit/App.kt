@@ -67,6 +67,9 @@ class App : Application() {
             AppLog.w("App started in Direct Boot mode (locked). Settings access deferred.")
         }
 
+        // 在 AppLog.init 之后：历史崩溃摘要要能进 DiagnosticJournal，随报告一起导出。
+        reportPreviousCrash()
+
         if (ConscryptInitializer.isAvailable()) {
             AppLog.i("Conscrypt security provider is active")
         } else if (ConscryptInitializer.isNeededForTls12()) {
@@ -138,6 +141,13 @@ class App : Application() {
      * 直接 android.util.Log.e + 立即 writeText。
      * 下一份诊断报告读的是 logcat，所以这一行 OPENHU FATAL 会跟着进去，
      * 不用再指望用户去接 adb。
+     *
+     * 0.3.4 起：
+     * - 每次崩溃写一份带时间戳的 crash-<ts>.txt（保留最近 5 份，不再互相覆盖），
+     *   头部带版本号/板子/线程，方便连着几次崩溃一起看；
+     * - 启动时 [reportPreviousCrash] 把历史崩溃摘要注入 AppLog，
+     *   于是诊断报告的 journal 段会带上「上次崩过」——用户不再需要
+     *   记住崩溃发生在哪一刻，报告自己会说。
      */
     private fun installCrashLogger() {
         val previous = Thread.getDefaultUncaughtExceptionHandler()
@@ -148,14 +158,52 @@ class App : Application() {
             }
             try {
                 val dir = getExternalFilesDir(null) ?: filesDir
-                java.io.File(dir, "crash-last.txt").writeText(
-                    "time=" + java.lang.System.currentTimeMillis() +
-                        " thread=" + thread.name + "\n" +
-                        android.util.Log.getStackTraceString(error)
-                )
+                val ts = System.currentTimeMillis()
+                val ver = runCatching {
+                    packageManager.getPackageInfo(packageName, 0).versionName
+                }.getOrNull() ?: "?"
+                val text = "time=$ts\n" +
+                    "version=$ver\n" +
+                    "android=${android.os.Build.VERSION.RELEASE}(API ${android.os.Build.VERSION.SDK_INT})\n" +
+                    "board=${android.os.Build.BOARD} model=${android.os.Build.MODEL}\n" +
+                    "thread=${thread.name}\n" +
+                    android.util.Log.getStackTraceString(error)
+                java.io.File(dir, "crash-$ts.txt").writeText(text)
+                java.io.File(dir, "crash-last.txt").writeText(text)
+                // 只留最近 5 份：崩溃刷屏时不要把用户存储撑爆。
+                val crashes = dir.listFiles { f ->
+                    f.name.startsWith("crash-") && f.name.endsWith(".txt")
+                } ?: emptyArray()
+                if (crashes.size > 5) {
+                    crashes.sortedBy { it.name }.take(crashes.size - 5).forEach { it.delete() }
+                }
             } catch (_: Throwable) {
             }
             previous?.uncaughtException(thread, error)
+        }
+    }
+
+    /**
+     * 启动时把磁盘上的历史崩溃摘要写进 AppLog。
+     *
+     * <p>必须在 AppLog.init 之后调用：DiagnosticJournal 要处于已初始化状态，
+     * 这些行才会进诊断报告。AppLog 未初始化时调用是安全的（退回 logcat），
+     * 但那样报告里就看不到。
+     */
+    private fun reportPreviousCrash() {
+        try {
+            val dir = getExternalFilesDir(null) ?: filesDir
+            val crashes = dir.listFiles { f ->
+                f.name.startsWith("crash-") && f.name.endsWith(".txt")
+            } ?: return
+            crashes.sortedBy { it.name }.takeLast(3).forEach { f ->
+                val head = f.readText().lineSequence().take(4).joinToString(" | ")
+                AppLog.w("[崩溃记录] ${f.name} → $head")
+            }
+            if (crashes.isNotEmpty()) {
+                AppLog.w("[崩溃记录] 共 ${crashes.size} 份崩溃文件在 ${dir.absolutePath}，完整栈见对应文件")
+            }
+        } catch (_: Throwable) {
         }
     }
 }
