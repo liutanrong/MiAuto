@@ -1354,7 +1354,16 @@ public class IccoaManager {
      * 等于白白多花这 1.9 秒 —— .18/.19 两轮日志里那 1.2 秒等待其实全落在
      * 「协商已经走完、画面却不会来」的空档上。
      */
-    private static final long COLD_START_TIMEOUT_MS = 1300L;
+    /**
+     * 首屏快判窗口（0.3.12 重定义）。
+     *
+     * <p>900ms 时代的判据是「无像素即死」，但 06:39 日志证明首连时手机端画面本身
+     * 接近纯黑（CarWith 深色确认页），像素采样永远读 0 —— 好会话被冤杀，重建 3 轮。
+     * 现在 2.5s 只用来触发一次**无感重绑**（pauseCast(false)+重投，手机无感知），
+     * 不是判死；连续两窗（≈5s）都无任何首帧信号才断会话重播。健康会话的
+     * onSurfaceReady 实测在 progress100 后 0.34~0.85s 到达，2.5s 绰绰有余。
+     */
+    private static final long COLD_START_TIMEOUT_MS = 2500L;
 
     /**
      * USB 链路的冷启动等待。
@@ -1393,33 +1402,16 @@ public class IccoaManager {
         public void run() {
             if (!castStarted || surfaceReady) return;
 
-            // ★ 冷启动第一场（本进程还没出过画面）：实测这一场手机压根不推视频流。
-            //   证据：第 1 场 4500ms 无像素 → 重绑 → 又 4500ms 仍无；
-            //   而重连后的第 2 场启动时 mIsFirstLaunch 仍为 true，说明第 1 场
-            //   连一个关键帧都没送到解码器。这一场无论换几次输出面都没用。
-            //   所以不再浪费 4.5 秒去做注定无效的重绑，直接快速重连，
-            //   把黑屏/等待时间压到最短。
-            if (!everSurfaceReady) {
-                // 注意这里用 COLD_START_TIMEOUT_MS 而不是 SURFACE_READY_TIMEOUT_MS：
-                // .18 的日志里文案打的是 4500，实际只等了 1200，对不上账。
-                log("✗ " + COLD_START_TIMEOUT_MS + "ms 无像素（本进程首场，手机未推流）"
-                        + " → 直接断会话，+" + COLD_START_RE_ADVERTISE_DELAY_MS + "ms 重播");
-                main.post(listener::onRecovering);
-                stats.reconnectCount++;
-                try {
-                    disconnectSession();
-                } catch (Throwable t) {
-                    log("disconnectSession 异常: " + t);
-                }
-                scheduleReAdvertise(COLD_START_RE_ADVERTISE_DELAY_MS);
-                return;
-            }
+            // ★ 0.3.12：冷启动与稳态统一为「重绑优先」。
+            //   旧逻辑认为首场手机不推流、重绑注定无效，一超时就直接断会话 ——
+            //   06:39 的 logcat 推翻了这个前提：onCastVideoInitialized / uibc->started
+            //   都到了，只是画面暗到像素采样读 0。重绑（setOutputSurface 路径）不拆
+            //   链路、手机无感知，是更安全的中间档；连续两窗都哑才断会话重播。
+            final long window = everSurfaceReady ? SURFACE_READY_TIMEOUT_MS : COLD_START_TIMEOUT_MS;
 
-            // 出过画面之后的中途失效：先重绑输出面（不拆会话，手机无感知），
-            // 仍不恢复再断会话。
             if (castRebuildCount == 0) {
                 castRebuildCount++;
-                log("✗ " + SURFACE_READY_TIMEOUT_MS + "ms 无像素 → 重绑输出面（不动会话）");
+                log("✗ " + window + "ms 无首帧信号 → 重绑输出面（不动会话，手机无感知）");
                 try {
                     adapter.pauseCast(false);
                 } catch (Throwable t) {
@@ -1430,17 +1422,19 @@ public class IccoaManager {
                 castStarted = false;
                 tryStartCast();
                 main.removeCallbacks(surfaceWatchdog);
-                main.postDelayed(surfaceWatchdog, SURFACE_READY_TIMEOUT_MS);
+                main.postDelayed(surfaceWatchdog, window);
                 return;
             }
 
-            log("✗ 重绑无效 → 断开会话并保持广播，等待手机重连");
+            log("✗ 重绑后仍无首帧 → 断开会话，+" + COLD_START_RE_ADVERTISE_DELAY_MS + "ms 重播");
             main.post(listener::onRecovering);
+            stats.reconnectCount++;
             try {
                 disconnectSession();
             } catch (Throwable t) {
                 log("disconnectSession 异常: " + t);
             }
+            scheduleReAdvertise(COLD_START_RE_ADVERTISE_DELAY_MS);
         }
     };
 
@@ -1490,7 +1484,13 @@ public class IccoaManager {
      *
      * <p>关掉它（改 false）就退回 .20 的行为：等 progress 90 + 900ms 再判死。
      */
-    private static final boolean EARLY_BAIL_ENABLED = true;
+    /**
+     * 秒断退役（0.3.12）。06:39 两次冷启动的日志实锤：第二场 progress 10 起投、
+     * 700ms 被掐，但 logcat 显示当时 onCastVideoInitialized/onWfdSinkReady 都已到达
+     * —— 手机在推流，这一刀纯属冤杀。「首场必不推流」的前提在空配落地后已全面失效。
+     * 首屏判定全部交给 surfaceWatchdog（重绑优先）+ 12s 兜底。
+     */
+    private static final boolean EARLY_BAIL_ENABLED = false;
     /** 从 progress 10 到主动断开之间的缓冲。留一点时间让手机把会话建完，否则它可能不认这次连接。 */
     private static final long EARLY_BAIL_MS = 700L;
 

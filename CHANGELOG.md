@@ -1,3 +1,19 @@
+# MiAuto 0.3.12 — 2026-10-25
+
+- **First-frame judgment rebuilt: "no pixels = dead" retired, rebind-first.** Logcat from
+  the 06:39 cold starts proves the killed first session had `onCastVideoInitialized`,
+  `onWfdSinkReady` and `uibc->started!` all firing — the phone was streaming the whole time;
+  the CarWith dark confirmation page is simply too dark for the pixel sampler, which read 0
+  and doomed a healthy session (hence "3 attempts to connect"). Now: 2.5 s with no
+  first-frame signal → one **seamless rebind** (pauseCast(false) + recast, phone unaware);
+  only after two silent windows (≈5 s) is the session torn down. Fast-fail intent kept,
+  blind eye replaced.
+- **Early bail fully retired**: the second session killed 700 ms after progress 10 was
+  equally innocent (same logcat proof). First-frame decisions now belong to the watchdog
+  plus the 12 s cast-stall backstop.
+- Pixel sampling demoted to a positive-only signal: non-black confirms and lifts the veil;
+  all-black is no longer evidence of failure.
+
 # MiAuto 0.3.11 — 2026-10-25
 
 - **First connect no longer needs 3 attempts.** The 700 ms early-bail assumed the old
