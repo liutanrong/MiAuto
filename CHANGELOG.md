@@ -1,3 +1,16 @@
+# MiAuto 0.3.8 — 2026-10-24
+
+- **Dead-frame protection actually fires now.** The 0.3.7 trigger required `deviceID == "-1"`,
+  but in real disconnects the device id usually stays valid (`dev=099b29`) — only the state
+  machine falls back to `STATE_-1`, so the guard never armed and the unit stayed frozen on the
+  last frame. Now any `-1` while a cast is running opens a 2 s confirmation window; it is
+  cancelled if negotiation keeps moving (states 1..3 or connecting progress > 0). Local
+  disconnects are unaffected (`disconnectSession` clears `castStarted` first).
+- **Transport badge fix.** The first frame can also arrive via SDK `onSurfaceReady()`, in which
+  case the pixel-sampling path returns early (`surfaceReady` already set) and
+  `resolveTransportLabel()` never ran — field logs show zero `[通道]` lines and no badge on
+  0.3.7. Both first-frame paths now resolve the transport.
+
 # MiAuto 0.3.7 — 2026-10-24
 
 - **USB priority actually works now.** `isUsbAttached()` used `UsbManager.getAccessoryList()`,

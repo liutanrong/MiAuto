@@ -1291,6 +1291,10 @@ public class IccoaManager {
                             + (tProgress100 == 0L ? "n/a" : (now - tProgress100) + "ms")
                             + "，距 startCast " + (now - tStartCast) + "ms"
                             + "，当时进度 " + lastProgress);
+                    // 0.3.8 修复：首帧也可能从 SDK onSurfaceReady 这条路进来，
+                    // 此时 onPixelsVisible 会因 surfaceReady 已置位而提前返回，
+                    // 导致通道角标永远不触发。两条首帧路径都必须判定通道。
+                    resolveTransportLabel();
                 }
             };
 
@@ -1555,13 +1559,15 @@ public class IccoaManager {
                     scheduleAutoRefresh();
                 }
             }
-            // ★ 僵死画面防护（0.3.7）。特征：deviceID 变成 "-1"（SDK 已经拿不到手机
-            //   的设备标识）且状态机掉回 STATE_-1，而画面曾经投出。这是手机端已经
-            //   异常离开的表现 —— 车机 Surface 会停在最后一帧，看起来像"卡死"。
-            //   加 2 秒确认窗：SDK 状态机里正常的过渡值（CONNECTED -> STATE_-1）
-            //   deviceID 是有效值，不受影响；只有真丢链才走这里。
-            if (castStarted && "-1".equals(deviceID) && newState == -1 && !linkLostArmed) {
+            // ★ 僵死画面防护（0.3.7，0.3.8 放宽）。实测真实断联时 deviceID 往往仍是
+            //   有效值（dev=099b29），只有状态机掉回 STATE_-1 —— 原来的
+            //   "-1".equals(deviceID) 条件导致防护从不触发，车机停在最后一帧。
+            //   现改为：只要投屏已开始、状态掉回 -1（无论标识是否还在），就开 2 秒
+            //   确认窗；窗口内手机重连/协商推进（state 1..3 或 connecting progress>0）
+            //   即撤销。本端主动断开不受影响（disconnectSession 先清 castStarted）。
+            if (castStarted && newState == -1 && !linkLostArmed) {
                 linkLostArmed = true;
+                log("· 连接状态掉回 STATE_-1，2 秒内未恢复则退出投屏页（僵死防护）");
                 main.postDelayed(linkLostRunnable, 2000L);
             } else if (newState >= 1 && newState <= 3) {
                 // 会话恢复（手机重连/协商继续），撤销待发的丢链判定
@@ -1576,6 +1582,13 @@ public class IccoaManager {
         public void onConnectingProgress(String phoneId, int progress) {
             log("onConnectingProgress " + progress);
             main.post(() -> listener.onProgress(progress));
+            // 僵死防护撤销（0.3.8）：真实断联后 SDK 常在 2 秒内重启协商（progress 10 起步），
+            // 只要协商还在推进就说明链路活着，撤掉待发的退出判定。
+            if (linkLostArmed && progress > 0) {
+                linkLostArmed = false;
+                main.removeCallbacks(linkLostRunnable);
+                log("· 协商仍在推进（进度 " + progress + "%），撤销退出投屏页判定");
+            }
             // ★ 协商到 100% 才意味着「会话建完了，接下来应该出画面」。
             //   实测 onSurfaceReady 通常在 100% 之后 1~3 秒到达；从这一刻开始计时，
             //   才不会在 progress 90→100 这段本来就慢的协商里误判。
