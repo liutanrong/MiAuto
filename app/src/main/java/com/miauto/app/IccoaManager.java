@@ -1799,7 +1799,7 @@ public class IccoaManager {
 
         try {
             boolean ok = adapter.sendTouchEvent(action, count,
-                    touch.ids(), touch.xs(), touch.ys());
+                    touch.idsTrimmed(), touch.xsTrimmed(), touch.ysTrimmed());
             // ★ 成功也要记一条。只在失败时打日志的话，「触摸没反应」时无从判断
             //   到底是事件没到、还是到了但被 SDK 拒、还是送到了手机但手机没执行。
             if (touch.takeLogSlot()) {
@@ -1818,7 +1818,7 @@ public class IccoaManager {
                 log("[UIBC] 被拒快照 " + IccoaUibcFix.snapshot(adapter));
                 ensureUibcSourceSize("touch-rejected");
                 boolean retry = adapter.sendTouchEvent(action, count,
-                        touch.ids(), touch.xs(), touch.ys());
+                        touch.idsTrimmed(), touch.xsTrimmed(), touch.ysTrimmed());
                 log("[UIBC] 懒补后重发 → " + (retry ? "已发送" : "仍被拒")
                         + " | " + IccoaUibcFix.snapshot(adapter));
             }

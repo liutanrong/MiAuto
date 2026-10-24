@@ -1,3 +1,13 @@
+# MiAuto 0.3.6 — 2026-10-24
+
+- **Touch finally fixed — it was our own bug.** 0.3.5's native-log capture exposed the
+  actual rejection reason: `UibcManager: sendTouchEvent failed: count error!` The SDK
+  requires `ids.length == xs.length == ys.length == count`, but IccoaTouch hands over
+  fixed 16-slot buffers while count is the real pointer count (1 for a tap). Every touch
+  was therefore illegal — regardless of transport. Arrays are now trimmed to `count`
+  before the call. This also explains "touch used to work in older versions": the old
+  code copied per-count arrays; the rewrite regressed it.
+
 # MiAuto 0.3.5 — 2026-10-24
 
 - **Native UIBC logs are now in the report.** `UibcManager.sendTouchEvent`'s last hop is

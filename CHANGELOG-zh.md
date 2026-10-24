@@ -1,3 +1,12 @@
+# MiAuto 0.3.6 — 2026-10-24
+
+- **触屏终于修好 —— 是我们自己的 bug。** 0.3.5 的 native 日志抓取让真实拒绝原因现形：
+  `UibcManager: sendTouchEvent failed: count error!`。SDK 要求
+  `ids.length == xs.length == ys.length == count`，而 IccoaTouch 传的是固定 16 格的
+  内部缓冲，count 却是真实手指数（单击就是 1）—— 16 ≠ 1，每一刀都非法，与通道无关。
+  现在调用前按 count 截取数组。这也解释了「旧版本触摸是好着的」：旧实现按 count
+  拷贝数组，重写时回归了这个细节。
+
 # MiAuto 0.3.5 — 2026-10-24
 
 - **native 层 UIBC 日志进报告。** `UibcManager.sendTouchEvent` 的最后一跳是

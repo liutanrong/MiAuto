@@ -116,4 +116,24 @@ final class IccoaTouch {
     int count() {
         return count;
     }
+
+    /**
+     * 按 count 截取的数组（0.3.6 修复触屏全拒的关键）。
+     *
+     * <p>SDK 的 sendTouchEvent 会检查 {@code ids.length == count && xs.length == count
+     * && ys.length == count}，不满足直接打 "count error!" 并拒绝。内部复用缓冲是
+     * 固定 16 长度，直接把缓冲传过去等于宣告每一刀都非法 —— 这就是「触摸永不生效」
+     * 的最终根因。必须在调用点截取到实际 count。
+     */
+    int[] idsTrimmed() {
+        return java.util.Arrays.copyOf(ids, count);
+    }
+
+    int[] xsTrimmed() {
+        return java.util.Arrays.copyOf(xs, count);
+    }
+
+    int[] ysTrimmed() {
+        return java.util.Arrays.copyOf(ys, count);
+    }
 }
