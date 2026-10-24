@@ -65,7 +65,7 @@
             android:layout_marginTop="26dp"
             android:alpha="0.55"
             android:textColor="#FFFFFF"
-            android:textSize="12sp" />
+            android:textSize="10sp" />
 
     </LinearLayout>
 
@@ -75,15 +75,15 @@
         android:id="@+id/icoca_transport"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="top|start"
-        android:layout_margin="10dp"
+        android:layout_gravity="bottom|end"
+        android:layout_margin="8dp"
         android:background="#66000000"
         android:paddingStart="12dp"
         android:paddingTop="4dp"
         android:paddingEnd="12dp"
         android:paddingBottom="4dp"
         android:textColor="#CCFFFFFF"
-        android:textSize="12sp"
+        android:textSize="10sp"
         android:visibility="gone"
         tools:text="P2P Wi-Fi 5GHz" />
 

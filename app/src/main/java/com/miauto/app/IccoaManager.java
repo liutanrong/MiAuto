@@ -1568,14 +1568,22 @@ public class IccoaManager {
             //   现改为：只要投屏已开始、状态掉回 -1（无论标识是否还在），就开 2 秒
             //   确认窗；窗口内手机重连/协商推进（state 1..3 或 connecting progress>0）
             //   即撤销。本端主动断开不受影响（disconnectSession 先清 castStarted）。
-            // ★ 僵死画面防护（0.3.8b 收窄）。只在「本进程画面曾经确认出过」之后才武装：
-            //   冻屏的前提是用户看到过画面；首场冷启动的「无像素 → 秒断 → 重播」是
-            //   正常恢复流程（everSurfaceReady=false），绝不能在这里退出投屏页 ——
-            //   否则每次冷启动都会把刚打开的投屏页杀掉，用户永远进不了投屏。
+            // ★ 僵死画面防护（0.3.10 修正判据）。SDK 在 progress 100 之后必然回调一次
+            //   CONNECTED -> STATE_-1 的过渡值（实测每个正常会话都有，首帧都出了它也来），
+            //   且此时 progress 已到顶、不会再有事件来撤销 —— 0.3.9 在这里 2 秒后必误杀，
+            //   造成「连上 2 秒 → 退出 → 手机还在 → 自动重连 → 再杀」的无限循环。
+            //   判据：距 progress 100 不足 3 秒的 -1 一律视为过渡值跳过；稳态期的 -1
+            //   （真丢链）才武装 2 秒确认窗。
+            long sinceP100 = tProgress100 == 0L ? Long.MAX_VALUE
+                    : System.currentTimeMillis() - tProgress100;
             if (castStarted && everSurfaceReady && newState == -1 && !linkLostArmed) {
-                linkLostArmed = true;
-                log("· 连接状态掉回 STATE_-1，2 秒内未恢复则退出投屏页（僵死防护）");
-                main.postDelayed(linkLostRunnable, 2000L);
+                if (sinceP100 < 3000L) {
+                    log("· CONNECTED 后的过渡 STATE_-1（距 progress100 " + sinceP100 + "ms），跳过僵死判定");
+                } else {
+                    linkLostArmed = true;
+                    log("· 稳态期连接状态掉回 STATE_-1，2 秒内未恢复则退出投屏页（僵死防护）");
+                    main.postDelayed(linkLostRunnable, 2000L);
+                }
             } else if (newState >= 1 && newState <= 3) {
                 // 会话恢复（手机重连/协商继续），撤销待发的丢链判定
                 linkLostArmed = false;

@@ -1,3 +1,15 @@
+# MiAuto 0.3.10 — 2026-10-24
+
+- **End the "connected for 2 s then killed" loop.** The SDK always fires a transitional
+  `CONNECTED -> STATE_-1` right after progress 100 (observed on every normal session, even
+  after the first frame), and no later progress event ever arrives to cancel the guard — so
+  0.3.9 mis-killed every session after 2 s while the phone was still connected, looping
+  connect → exit → reconnect (sessions 5, 6, 7...). New rule: a `-1` within 3 s of
+  progress 100 is treated as transitional and skipped; only a steady-state `-1` arms the
+  2 s window.
+- **Transport badge moved to bottom-right, 12sp → 10sp** — the top-left corner overlapped
+  head-unit status info.
+
 # MiAuto 0.3.9 — 2026-10-24
 
 - **Dead-frame guard no longer kills cold start; projection page enterable again.** Field
