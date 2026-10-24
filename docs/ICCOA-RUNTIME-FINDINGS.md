@@ -506,3 +506,54 @@ start() ─ init(config) ─ onInitSuccess ─ startAdvertise ─ onPinCode
 1. **换手机端复测**（小米 CarWith / OPPO Car+），确认是否为 Jovi InCar 特有；
 2. **常驻保活**：让会话永不走「首连」，代价是熄火/休眠后仍需重建；
 3. **启动即消耗**：应用启动后主动断一次再广播，代价是用户看到两次配对码。
+
+---
+
+## 14. 0.3.4 实测后的触屏定位（§8 的续篇）
+
+0.3.4 的懒补让 `[UIBC] 快照` 全绿（source=1280x672 display=1280x672 enc=settled
+session=[ip]:7236），但 P2P 无线会话的触摸仍 100% 被拒（62/62）。由此确认：
+
+### 14.1 sendTouchEvent 的完整返回路径（修正 §8）
+
+Java 层只有 4 个 false 分支，全部可从快照排除：
+
+| 分支 | 排除证据 |
+|---|---|
+| ids/xs/ys 数组长度 != count | 数组由我们自己的代码构造 |
+| mIsEncryptionSettled == false | 快照 enc=settled |
+| mSourceWidth/Height <= 0 | 懒补后 source=1280x672 |
+| JSONException | 未抛 |
+
+最终一跳是 `SinkNative.onUibcEvent(mSessionID, payload)` —— **native 方法**，
+实现在 `libovmsink.so`（不在 APK 的其它 so 里，JNI 用 RegisterNatives 动态注册）。
+它返回 false 就是"被拒"的真相：**拒绝发生在 native 的 UIBCSession**。
+
+### 14.2 libovmsink.so 的 UIBC 失败日志（0.3.5 已抓进报告）
+
+| 日志 | 含义 |
+|---|---|
+| `uibc->start...` / `uibc->started!` | UIBC TCP 通道建立成功 |
+| `uibc->started, connect failed!` | sink 连手机 UIBC 端口被拒（手机侧授权/防火墙） |
+| `uibc->event, ECONNRESET, EPIPE!` | 通道建立后发送时被断 |
+| `uibc->event, send datalen check failed!` | 发送数据长度校验失败 |
+| `wfd_uibc_capability: …;port=none` | RTSP 协商模板，port 值决定手机是否发起 UIBC 连接 |
+| `Source report uibc encprted` | 手机侧声明加密（注意源码拼写就是 encprted） |
+
+这些行走 `__android_log`，不进 easylog_ 通道 —— 0.3.4 报告抓不到，恰好盲在触屏
+死掉的那一层。0.3.5 的 `readNativeUibcLogcat()` 按 `uibc|ovmsink|nativeremotedisplay`
+关键词补抓。
+
+### 14.3 间歇性的关键观察
+
+同一版本（0.3.2 时代）、同为 USB 通道：10/23 08:33 会话触控 128 条全部"已发送"
+（native 通了），09:14 会话 Java 层就全拒（source=0）。同通道不同结果 → 变量在
+手机端状态（Jovi InCar 的 UIBC 授权/协商结果）或会话时序，而不是车机端单一代码路径。
+下一份报告的 `uibc->` 行将区分"没连上"与"连上被断"。
+
+### 14.4 libusbio.so 全零崩溃（已结案）
+
+10/23 21:45-21:48 连崩 9 次：`UnsatisfiedLinkError: dlopen failed:
+libusbio.so has bad ELF magic: 00000000`。仓库与构建产物里的 so 一直是合法 ELF
+（215040 B），损坏发生在设备存储层（/data/app 里的安装包）。重装即解。
+0.3.5 加了启动预检（落明确诊断 + 文件头快照）和构建期 `verifyNativeLibsElf`。
