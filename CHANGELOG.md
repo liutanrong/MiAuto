@@ -1,3 +1,15 @@
+# MiAuto 0.3.14 — 2026-10-25
+
+- **Cold-start rebind window widened 2500 → 4000 ms.** First 0.3.13 field report (07:38):
+  priming retirement works — the 90→100 negotiation dropped from ~1900 ms to 264 ms and
+  session 2 rendered its first frame 211 ms after progress 100. But the first session was
+  still bounced once: the video pipeline (onCastVideoInitialized / onWfdSinkReady, confirmed
+  in raw logcat) finished ~2.55 s after startCast, i.e. the 2.5 s window expired ~50 ms
+  *before* the pipeline was even ready. Session 2's pattern (onWfdSinkReady → first frame
+  ~200 ms later) says session 1 would most likely have painted on its own. 4 s leaves a
+  full init→first-frame margin; worst case is ~1.5 s extra wait before the existing
+  rebind→re-advertise fallback.
+
 # MiAuto 0.3.13 — 2026-10-25
 
 - **Offscreen priming retired — the true culprit of the dead first session.** The 07:17

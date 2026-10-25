@@ -1363,15 +1363,20 @@ public class IccoaManager {
      * 「协商已经走完、画面却不会来」的空档上。
      */
     /**
-     * 首屏快判窗口（0.3.12 重定义）。
+     * 首屏快判窗口（0.3.12 重定义；0.3.14 再放宽 2500 → 4000ms）。
      *
      * <p>900ms 时代的判据是「无像素即死」，但 06:39 日志证明首连时手机端画面本身
      * 接近纯黑（CarWith 深色确认页），像素采样永远读 0 —— 好会话被冤杀，重建 3 轮。
-     * 现在 2.5s 只用来触发一次**无感重绑**（pauseCast(false)+重投，手机无感知），
-     * 不是判死；连续两窗（≈5s）都无任何首帧信号才断会话重播。健康会话的
-     * onSurfaceReady 实测在 progress100 后 0.34~0.85s 到达，2.5s 绰绰有余。
+     * 0.3.12 起超时只触发一次**无感重绑**（pauseCast(false)+重投，手机无感知），
+     * 不是判死；连续两窗都无任何首帧信号才断会话重播。
+     *
+     * <p>0.3.14 依据（07:38 首份 0.3.13 实测）：空配退役后 90→100 只需 264ms，
+     * 但 video 管线初始化（onCastVideoInitialized / onWfdSinkReady）实测要
+     * startCast 后 ~2.55s 才完成 —— 2.5s 窗口在管线就绪前 50ms 就到期，
+     * 第一场被冤杀一次。参照第二场模式（onWfdSinkReady → ~200ms 出首帧），
+     * 4s 给足「init → 首帧」余量；最坏情况多等 1.5s 才走重绑→断开老链兜底。
      */
-    private static final long COLD_START_TIMEOUT_MS = 2500L;
+    private static final long COLD_START_TIMEOUT_MS = 4000L;
 
     /**
      * USB 链路的冷启动等待。
