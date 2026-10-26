@@ -1,3 +1,24 @@
+# MiAuto 0.3.18 — 2026-10-26
+
+**D1/D2/D4/D5/D6/D8/D10/D11（D3、D7 本轮不做）**
+
+- **D1 自伤停机修复（本轮最关键）**：SDK 把我们自己的 `disconnect()` 也回调成
+  `DISCONNECTED(param=11)`，0.3.17 因此把每次看门狗断开都判成"用户主动断开"→ 停机 →
+  只能手动点刷新（10/26 21:19、21:20 两次实测）。现在记 `selfDisconnectAt`：
+  3 秒内到达的 `param=11` 视为本端断开回执，按已排程的重播继续；只有无本端记录的 11 才停机。
+- **D2 首场专项**：本进程第一场不出画时，先做**会话内重建解码器**——反射
+  `UCarAdapter.mCastManager` → `CastManager.stopCast()`（反编译确认它只 `mVideoPlayer.release()`，
+  不动 WFD 会话），再 `startCast()` 重建一个新的 VideoPlayerV2。最多 2 次（D11），
+  仍失败才回到"重绑 → 断开重播"。
+- **D4 AOA 判定**：不再只看 `getAccessoryList()`（本机恒为空）。新增三选一：
+  accessory 列表 / `18D1:2D00|2D01` UsbDevice / `usb0|rndis` 接口。
+- **D5 通道标签**：`phoneId=-1` 时不再拿上一场设备猜 connectType，明确置"未知"；
+  每场会话重置 `connectType`；未知时显示 `P2P Wi-Fi（频段未知）`，绝不贴旧值。
+  判定优先级固定为 **AOA 证据 → connectType → 频段**。
+- **D6 5G 只提示**：`[5G] 组频段=… 判定=…` 每会话只打一次；2.4G 只改角标，不中断会话。
+- **D8 日志去重**：连接轮次结果只记一次（state 4/2 不再各打一条）；断开/停机各只处理一次。
+- **D10**：`[连接] 第 N 轮结果=… 通道=USB/P2P/未知 用时=… 阶段=…%`。
+
 # MiAuto 0.3.17 — 2026-10-26
 
 **A 批：连接稳定性（A1–A10）**

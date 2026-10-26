@@ -1,3 +1,25 @@
+# MiAuto 0.3.18 — 2026-10-26
+
+**D1/D2/D4/D5/D6/D8/D10/D11 (D3 and D7 not in this round)**
+
+- **D1 self-disconnect fix (the big one).** The SDK reports *our own* `disconnect()` as
+  `DISCONNECTED(param=11)` — identical to a phone-side user disconnect. 0.3.17 therefore treated
+  every watchdog disconnect as user intent and stopped advertising, forcing a manual refresh
+  (reproduced twice on 10/26 at 21:19 and 21:20). A `selfDisconnectAt` timestamp now marks
+  `param=11` within 3 s as our own teardown; only an unclaimed 11 enters the stopped state.
+- **D2 first-session rebuild.** When the first session of a process shows no frame, rebuild the
+  decoder *inside* the session: reflect `UCarAdapter.mCastManager` → `CastManager.stopCast()`
+  (decompiled: it only releases `mVideoPlayer`, the WFD session is untouched) and `startCast()`
+  again. At most twice (D11), then fall back to rebind → reconnect.
+- **D4 AOA detection** no longer relies on `getAccessoryList()` (always empty on this unit):
+  accessory list OR `18D1:2D00|2D01` UsbDevice OR `usb0|rndis` interface.
+- **D5 channel label**: a `phoneId` of -1 no longer reuses the previous session's connectType;
+  reset per session, and show `P2P Wi-Fi（band unknown）` instead of a stale value. Priority is
+  now AOA evidence → connectType → band.
+- **D6** the `[5G]` line is printed once per session; 2.4 GHz only annotates the badge.
+- **D8** deduplicated logs (one round-result line, one disconnect/stop handling).
+- **D10** round result now includes the channel: `通道=USB/P2P/未知`.
+
 # MiAuto 0.3.17 — 2026-10-26
 
 **Batch A: connection stability (A1–A10)**

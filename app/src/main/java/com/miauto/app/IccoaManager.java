@@ -198,6 +198,24 @@ public class IccoaManager {
     private volatile boolean advertiseAttempted = false;
     /** 广播失败重试计数（A4）。 */
     private int advertiseRetryCount = 0;
+
+    /**
+     * 本端主动 disconnect() 的时刻（0.3.18，D1）。
+     *
+     * <p>SDK 把我们自己的 {@code disconnect()} 也回调成 {@code DISCONNECTED(param=11)} ——
+     * 与"手机端用户主动断开"完全同一个值。不记这个时间戳，看门狗每次断开都会被当成
+     * 用户断开 → 进入停机 → 只能手动点刷新（10/26 21:19、21:20 两次实测都是这样）。
+     */
+    private volatile long selfDisconnectAt = 0L;
+
+    /** 首场"会话内重建解码器"已尝试次数（D2/D11）：最多 2 次，之后回到断开重连。 */
+    private int decoderRebuildCount = 0;
+
+    /** [5G] 每会话只打一次（D8）。 */
+    private boolean fiveGLogged = false;
+
+    /** 本轮的「结果」是否已记录（state 4 与 state 2 会各来一次，避免重复行）。 */
+    private boolean roundResultLogged = false;
     /** 上一次 init() 时实际采用的通道（native-ap-transport 的值），用于检测配置变更。 */
     private int appliedTransport = Integer.MIN_VALUE;
 
@@ -757,14 +775,20 @@ public class IccoaManager {
             // ★ getConnectType(String) 在查不到设备时**返回 1**（默认值），这会让
             //   "没查到" 看起来像 "走的是 P2P"。所以先用 getMobileDevice 判断设备是否存在，
             //   存在才读它的 connectType；会话切换瞬间 phoneId 常是 "-1"，需要用缓存的上一个。
+            // ★ D5（0.3.18）：会话里的 phoneId 常常是 "-1"（SDK 没回填设备号）。
+            //   旧实现会拿 lastDeviceId 去猜 —— 那是**上一场**的设备，于是 USB 会话
+            //   会被贴上上一场的 "P2P"（21:21 那场角标误报 5GHz 就是这么来的）。
+            //   现在：设备号无效就明确置"未知"，由角标按 AOA 证据兜底。
             String id = phoneId;
-            UCarCommon.MobileDevice dev = adapter.getMobileDevice(id);
-            if (dev == null && lastDeviceId != null) {
-                id = lastDeviceId;
-                dev = adapter.getMobileDevice(id);
+            if (id == null || id.isEmpty() || "-1".equals(id)) {
+                stats.connectType = -1;
+                log("[通道判定] 设备号无效（phoneId=" + phoneId + "）→ 本次通道未知，按 AOA 证据判定");
+                return;
             }
+            UCarCommon.MobileDevice dev = adapter.getMobileDevice(id);
             if (dev == null) {
-                log("[通道判定] 未找到设备（phoneId=" + phoneId + " lastId=" + lastDeviceId + "），本次不判定");
+                stats.connectType = -1;
+                log("[通道判定] 未找到设备（phoneId=" + phoneId + "）→ 本次通道未知");
                 return;
             }
             int ct = dev.getConnectType();
@@ -913,66 +937,67 @@ public class IccoaManager {
      */
     private void resolveTransportLabel() {
         final int ct = stats.connectType;
-        if (ct == 3) {
-            transportLabel = "SoftAP Wi-Fi";
-            log("[通道] 当前数据通道：" + transportLabel);
-            try { listener.onTransportLabel(transportLabel); } catch (Throwable ignored) { }
+        final boolean aoa = isAoaActive();
+
+        // ★ D4/D5（0.3.18）判定优先级：AOA 证据 > connectType > 频段。
+        //   之前只看 connectType，而 dev=-1 的会话读不到类型、还会沿用上一场的值，
+        //   于是 USB 会话被标成 P2P 5GHz（10/26 21:21 实测）。
+        if (aoa) {
+            setTransport("USB AOA 有线", "AOA 设备/usb0 接口");
             return;
         }
         if (ct == 2) {
-            transportLabel = "USB AOA 有线";
-            log("[通道] 当前数据通道：" + transportLabel);
-            try { listener.onTransportLabel(transportLabel); } catch (Throwable ignored) { }
+            setTransport("USB AOA 有线", "connectType=2");
             return;
         }
-        if (ct != 1 && isAoaAccessoryPresent()) {
-            // connectType 读不到（dev=-1 的场次）但确实有 AOA 配件 → 按有线报
-            transportLabel = "USB AOA 有线";
-            log("[通道] 当前数据通道：" + transportLabel + "（connectType 未知，按 AOA 配件判定）");
-            try { listener.onTransportLabel(transportLabel); } catch (Throwable ignored) { }
+        if (ct == 3) {
+            setTransport("SoftAP Wi-Fi", "connectType=3");
             return;
         }
-        String label = "P2P Wi-Fi";
-        {
-            try {
-                android.net.wifi.p2p.WifiP2pManager wm = (android.net.wifi.p2p.WifiP2pManager)
-                        appCtx.getSystemService(Context.WIFI_P2P_SERVICE);
-                if (wm != null) {
-                    android.net.wifi.p2p.WifiP2pManager.Channel ch =
-                            wm.initialize(appCtx, main.getLooper(), null);
-                    wm.requestGroupInfo(ch, group -> {
-                        String l = "P2P Wi-Fi";
-                        if (group != null) {
-                            int freq = -1;
-                            try {
-                                Object f = group.getClass().getMethod("getFrequency").invoke(group);
-                                freq = (Integer) f;
-                                if (freq >= 4900) {
-                                    l = "P2P Wi-Fi 5GHz";
-                                } else if (freq > 0) {
-                                    // ★ 0.3.17（A9）：只提示、不打断 —— 2.4G 不代表连不上，
-                                    //   但它是「5GHz 还卡」最重要的归因线索：真跑在 2.4G 上，
-                                    //   卡顿就有答案了（信道拥挤 + 带宽只有 5G 的零头）。
-                                    l = "P2P Wi-Fi 2.4GHz（建议改 5G）";
-                                }
-                            } catch (Throwable ignored) {
-                                // hidden API 被裁剪就退回无频段的描述
+
+        // 到这里是 P2P（ct=1）或未知：读组的实际频率来细分 2.4G / 5G。
+        try {
+            android.net.wifi.p2p.WifiP2pManager wm = (android.net.wifi.p2p.WifiP2pManager)
+                    appCtx.getSystemService(Context.WIFI_P2P_SERVICE);
+            if (wm != null) {
+                android.net.wifi.p2p.WifiP2pManager.Channel ch =
+                        wm.initialize(appCtx, main.getLooper(), null);
+                wm.requestGroupInfo(ch, group -> {
+                    String l = "P2P Wi-Fi（频段未知）";
+                    int freq = -1;
+                    if (group != null) {
+                        try {
+                            Object f = group.getClass().getMethod("getFrequency").invoke(group);
+                            freq = (Integer) f;
+                            if (freq >= 4900) {
+                                l = "P2P Wi-Fi 5GHz";
+                            } else if (freq > 0) {
+                                // A9：只提示、不打断。2.4G 是「卡顿」最重要的归因线索。
+                                l = "P2P Wi-Fi 2.4GHz（建议改 5G）";
                             }
-                            log("[5G] 组频段=" + (freq > 0 ? freq + "MHz" : "读不到")
-                                    + " 判定=" + (freq >= 4900 ? "5G" : freq > 0 ? "2.4G" : "未知"));
+                        } catch (Throwable ignored) {
+                            // hidden API 被裁剪 → 频段未知
                         }
-                        transportLabel = l;
-                        log("[通道] 当前数据通道：" + l);
-                        try { listener.onTransportLabel(l); } catch (Throwable ignored) { }
-                    });
-                    return;
-                }
-            } catch (Throwable ignored) {
-                // P2P 服务不可用 → 保持 "P2P Wi-Fi"
+                    }
+                    final int f2 = freq;
+                    if (!fiveGLogged) {
+                        fiveGLogged = true;
+                        log("[5G] 组频段=" + (f2 > 0 ? f2 + "MHz" : "读不到")
+                                + " 判定=" + (f2 >= 4900 ? "5G" : f2 > 0 ? "2.4G" : "未知"));
+                    }
+                    setTransport(l, "connectType=" + ct + " / 频段=" + (f2 > 0 ? f2 + "MHz" : "未知"));
+                });
+                return;
             }
+        } catch (Throwable ignored) {
         }
+        setTransport("P2P Wi-Fi（频段未知）", "connectType=" + ct);
+    }
+
+    /** 统一出口：写标签 + 打一行「依据」（D8：同一会话不重复刷）。 */
+    private void setTransport(String label, String evidence) {
         transportLabel = label;
-        log("[通道] 当前数据通道：" + label);
+        log("[通道] 当前数据通道：" + label + "（依据：" + evidence + "）");
         try { listener.onTransportLabel(label); } catch (Throwable ignored) { }
     }
 
@@ -1098,6 +1123,7 @@ public class IccoaManager {
                 log("stopAdvertise 异常: " + t);
             }
             try {
+                selfDisconnectAt = System.currentTimeMillis();
                 adapter.disconnect();
             } catch (Throwable t) {
                 log("disconnect 异常: " + t);
@@ -1233,6 +1259,7 @@ public class IccoaManager {
         log("=== 停止 ===");
         if (adapter != null) {
             try { adapter.pauseCast(); } catch (Throwable t) { log("pauseCast 异常: " + t); }
+            selfDisconnectAt = System.currentTimeMillis();
             try { adapter.disconnect(); } catch (Throwable t) { log("disconnect 异常: " + t); }
             try { adapter.stopAdvertise(); } catch (Throwable t) { log("stopAdvertise 异常: " + t); }
             try {
@@ -1284,6 +1311,7 @@ public class IccoaManager {
         cancelNegotiationRescue();
         main.removeCallbacks(surfaceWatchdog);
         linkLostArmed = false;
+        fiveGLogged = false;
         main.removeCallbacks(linkLostRunnable);
         log("· 会话清理（" + reason + "）");
     }
@@ -1294,6 +1322,10 @@ public class IccoaManager {
      * <p>只停广播、不动 SDK 之外的东西；用户点「刷新配对码」或主页「连接」即恢复。
      */
     private void enterPaused(String why) {
+        if (paused) {
+            // D8：本端断开与手机端断开回执会前后脚各来一次，只处理第一条。
+            return;
+        }
         paused = true;
         sessionActive = false;
         negotiating = false;
@@ -1329,14 +1361,27 @@ public class IccoaManager {
     /** 连接轮次计时起点（每次重播/起播算一轮）。 */
     private void startConnectRound(String why) {
         connectRound++;
+        roundResultLogged = false;
         connectRoundStartMs = System.currentTimeMillis();
         log("[连接] 第 " + connectRound + " 轮开始（" + why + "）");
     }
 
     private void logConnectRoundResult(String result) {
+        // state=4（投屏已连）与 state=2（已连）会前后脚各来一次，只记第一条（D8）。
+        if (roundResultLogged) return;
+        if ("成功".equals(result)) roundResultLogged = true;
         long ms = connectRoundStartMs == 0L ? -1L : System.currentTimeMillis() - connectRoundStartMs;
-        log("[连接] 第 " + connectRound + " 轮结果=" + result
+        log("[连接] 第 " + connectRound + " 轮结果=" + result + " 通道=" + channelShort()
                 + (ms >= 0 ? " 用时=" + ms + "ms" : "") + " 阶段=" + lastProgress + "%");
+    }
+
+    /** 当前通道的短名（诊断用，D10）：USB / P2P / 未知。 */
+    private String channelShort() {
+        if (isAoaActive()) return "USB";
+        int ct = stats.connectType;
+        if (ct == 2) return "USB";
+        if (ct == 1 || ct == 3) return "P2P";
+        return "未知";
     }
 
     /**
@@ -1385,6 +1430,7 @@ public class IccoaManager {
             //   反而可能让手机进入「被切走」状态、推迟自动重连 —— 而重连正是
             //   冷启动首场之后恢复画面的唯一路径。
             try { adapter.pauseCast(false); } catch (Throwable t) { log("pauseCast 异常: " + t); }
+            selfDisconnectAt = System.currentTimeMillis();
             try { adapter.disconnect(); } catch (Throwable t) { log("disconnect 异常: " + t); }
         }
         sessionActive = false;
@@ -1407,6 +1453,7 @@ public class IccoaManager {
     public void userDisconnect() {
         log("=== 用户主动断开（保持停机）===");
         try { if (adapter != null) adapter.pauseCast(false); } catch (Throwable ignored) { }
+        selfDisconnectAt = System.currentTimeMillis();
         try { if (adapter != null) adapter.disconnect(); } catch (Throwable ignored) { }
         endSession("用户主动断开");
         enterPaused("用户主动断开");
@@ -1829,6 +1876,43 @@ public class IccoaManager {
     }
 
     /**
+     * 会话内重建解码器（0.3.18，D2）。
+     *
+     * <p>冷启动第一场的顽症：progress 100、状态 CONNECTED，但 {@code onSurfaceReady} 永不回调、
+     * 像素恒 0；同一进程的第二场却 300~800ms 就出画。差别不在链路，在<b>解码器实例</b>。
+     *
+     * <p>反编译 {@code CastManager.stopCast()} 只有一行：{@code mVideoPlayer.release()} ——
+     * 它<b>不动 WFD 会话、不动手机端</b>；而 {@code CastManager.startCast()} 每次都会
+     * {@code new VideoPlayerV2(...)} 再 {@code init(surface, w, h)}。也就是说：
+     * 只要"release + 重建一个新的"，就等价于第二场那个能出画的解码器，而链路完全不用拆。
+     *
+     * <p>反射路径：{@code UCarAdapter.mCastManager}（私有字段）→ {@code CastManager.stopCast()}；
+     * 然后走我们自己的 {@code tryStartCast()}。任何一步失败都返回 false，调用方回退到原来的
+     * "重绑输出面"逻辑，行为不比 0.3.17 差。
+     */
+    private boolean rebuildDecoderInSession() {
+        if (adapter == null) return false;
+        try {
+            java.lang.reflect.Field f = adapter.getClass().getDeclaredField("mCastManager");
+            f.setAccessible(true);
+            Object cm = f.get(adapter);
+            if (cm == null) {
+                log("[重建] 反射拿不到 CastManager，回退重绑");
+                return false;
+            }
+            java.lang.reflect.Method stop = cm.getClass().getMethod("stopCast");
+            stop.invoke(cm);
+            log("[重建] 已释放 VideoPlayerV2（stopCast，不动会话）→ 立即重建并重投");
+            castStarted = false;
+            tryStartCast();
+            return true;
+        } catch (Throwable t) {
+            log("[重建] stopCast 反射不可用: " + t);
+            return false;
+        }
+    }
+
+    /**
      * 首屏看门狗。
      *
      * <p>判定依据改成「像素是否出过」而不是「onSurfaceReady 是否到过」—— 后者在
@@ -1852,6 +1936,16 @@ public class IccoaManager {
 
             if (castRebuildCount == 0) {
                 castRebuildCount++;
+                // ★ D2（0.3.18）：本进程还没出过画面 → 先试"会话内重建解码器"。
+                //   这是唯一对症的动作：release 旧 VideoPlayerV2 再 new 一个，
+                //   WFD 会话与手机端全程无感。最多 2 次，之后回到断开重连（D11）。
+                if (!everSurfaceReady && decoderRebuildCount < 2 && rebuildDecoderInSession()) {
+                    decoderRebuildCount++;
+                    log("· 首场重建解码器第 " + decoderRebuildCount + " 次，再给 " + window + "ms 看首帧");
+                    main.removeCallbacks(surfaceWatchdog);
+                    main.postDelayed(surfaceWatchdog, window);
+                    return;
+                }
                 log("✗ " + window + "ms 无首帧信号 → 重绑输出面（不动会话，手机无感知）");
                 try {
                     adapter.pauseCast(false);
@@ -2008,17 +2102,54 @@ public class IccoaManager {
      * 都必须用这个更严格的判据。
      */
     private boolean isAoaAccessoryPresent() {
+        return isAoaActive();
+    }
+
+    /**
+     * 是否真的在走 AOA（0.3.18，D4）。
+     *
+     * <p>10/26 21:21 实测：手机已进入 accessory 模式（USB 列表里出现
+     * <code>18D1:2D00</code>，SDK 侧 {@code UCar_AOASocketReadThread} 在跑），
+     * 但 {@code UsbManager.getAccessoryList()} **恒为空** —— 只看它会把 USB 会话判成"非 AOA"，
+     * 角标于是显示上一场的 P2P 频段。
+     *
+     * <p>三条证据任一成立即算 AOA：
+     * <ol>
+     *   <li>accessory 列表非空（标准路径）；</li>
+     *   <li>存在 VID {@code 0x18D1}（Google）且 PID {@code 0x2D00/0x2D01} 的 UsbDevice
+     *       —— 这就是 AOA 在本机的枚举形态；</li>
+     *   <li>存在 {@code usb0} / {@code rndis0} 网络接口（AOA 数据面已起）。</li>
+     * </ol>
+     */
+    private boolean isAoaActive() {
         try {
             android.hardware.usb.UsbManager um =
                     (android.hardware.usb.UsbManager) appCtx.getSystemService(Context.USB_SERVICE);
-            if (um == null) {
-                return false;
+            if (um != null) {
+                android.hardware.usb.UsbAccessory[] acc = um.getAccessoryList();
+                if (acc != null && acc.length > 0) return true;
+                java.util.HashMap<String, android.hardware.usb.UsbDevice> devs = um.getDeviceList();
+                if (devs != null) {
+                    for (android.hardware.usb.UsbDevice d : devs.values()) {
+                        if (d.getVendorId() == 0x18D1
+                                && (d.getProductId() == 0x2D00 || d.getProductId() == 0x2D01)) {
+                            return true;
+                        }
+                    }
+                }
             }
-            android.hardware.usb.UsbAccessory[] acc = um.getAccessoryList();
-            return acc != null && acc.length > 0;
-        } catch (Throwable t) {
-            return false;
+        } catch (Throwable ignored) {
         }
+        try {
+            java.util.Enumeration<java.net.NetworkInterface> en =
+                    java.net.NetworkInterface.getNetworkInterfaces();
+            while (en != null && en.hasMoreElements()) {
+                String n = en.nextElement().getName();
+                if (n != null && (n.startsWith("usb0") || n.startsWith("rndis"))) return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
     }
 
     private void cancelEarlyBail() {
@@ -2066,6 +2197,7 @@ public class IccoaManager {
                     paused = false;
                     wirelessFailStreak = ReconnectBackoff.resetStreak();
                     castRebuildCount = 0;
+                    decoderRebuildCount = 0;
                     logConnectRoundResult("成功");
                     // SDK 建链成功后会自己 stopAdvertise()，兜底广播必须同步停，
                     // 否则手机端会把同一台车当成"可连接的陌生设备"反复重扫。
@@ -2117,8 +2249,14 @@ public class IccoaManager {
                         log("· 初始 DISCONNECTED（尚未建链），忽略");
                         break;
                     }
-                    boolean byUser = (param == DISCONNECT_BY_USER);
-                    log("会话断开（param=" + param + "，" + (byUser ? "用户/手机主动断开" : "异常断连") + "）");
+                    // ★ D1：param=11 有两种来源 —— 手机端用户断开，以及**我们自己**刚调用的
+                    //   disconnect()。后者 3 秒内到达，必须按"本端断开"处理，否则看门狗每次
+                    //   断开都会把车机送进停机态。
+                    final boolean selfInitiated =
+                            (System.currentTimeMillis() - selfDisconnectAt) < 3000L;
+                    boolean byUser = (param == DISCONNECT_BY_USER) && !selfInitiated;
+                    log("会话断开（param=" + param + "，"
+                            + (selfInitiated ? "本端断开回执" : byUser ? "用户/手机主动断开" : "异常断连") + "）");
                     // 先判僵死（要用 castStarted/everSurfaceReady），再清状态
                     armLinkLostIfNeeded(state);
                     endSession(byUser ? "用户主动断开" : "异常断连");
@@ -2126,6 +2264,9 @@ public class IccoaManager {
                     if (byUser || paused) {
                         // ★ 你的决定（0.3.17）：用户断开后保持停机，绝不自动连回去。
                         enterPaused("手机端主动断开");
+                    } else if (selfInitiated) {
+                        // 本端断开：调用方（看门狗/重播链）已经排好重播，这里不再叠加。
+                        log("· 本端断开的回执，按已排程的重播继续");
                     } else {
                         scheduleReAdvertise(ReconnectBackoff.nextDelayMs(false, 0));
                         scheduleAutoRefresh();
@@ -2194,6 +2335,9 @@ public class IccoaManager {
                 lastSegMs = -1L;
                 lastFirstFrameMs = -1L;
                 firstFrameFromStart = false;
+                // D5：通道类型也必须按场重置，否则 dev=-1 的会话会沿用上一场的 P2P。
+                stats.connectType = -1;
+                fiveGLogged = false;
                 surfaceReady = false;   // 否则上一轮成功会污染这一轮的「结果=正常/黑屏」
                 castRetry = 0;
                 connectTypeLogged = false;
