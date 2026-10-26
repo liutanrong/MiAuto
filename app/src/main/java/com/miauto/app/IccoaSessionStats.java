@@ -26,6 +26,10 @@ final class IccoaSessionStats {
     long lastFirstFrameMs = -1L;
     boolean firstFrameBeforeProgress100 = false;
 
+    /** 本会话里「≥2 指」的触摸事件数 / 最大手指数（0.3.15，用于验证双指缩放是否真的发出去了）。 */
+    int multiTouchEvents = 0;
+    int multiTouchMax = 0;
+
     int connectType = -1;
     String phoneModel = "";
     int surfaceW = -1;
@@ -97,9 +101,16 @@ final class IccoaSessionStats {
             sb.append(" 首帧=未就绪");
         }
 
+        if (multiTouchEvents > 0) {
+            sb.append(" 多点=").append(multiTouchEvents).append("次/最多").append(multiTouchMax).append("指");
+        }
         sb.append(" 会话=").append(castCount).append(" 重连=").append(reconnectCount);
         if (connectType > 0) {
-            sb.append(" 通道=").append(connectType == 1 ? "P2P" : "SoftAP");
+            // 0.3.15：旧写法把 2（USB AOA）也归进 else 打成 "SoftAP"，与角标自相矛盾。
+            sb.append(" 通道=").append(connectType == 1 ? "P2P"
+                    : connectType == 2 ? "USB"
+                    : connectType == 3 ? "SoftAP"
+                    : ("?" + connectType));
         }
         if (!phoneModel.isEmpty()) {
             sb.append(" 手机=").append(phoneModel);

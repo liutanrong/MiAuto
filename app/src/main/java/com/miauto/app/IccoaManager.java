@@ -221,6 +221,14 @@ public class IccoaManager {
             return;
         }
         if (attached) {
+            // ★ 0.3.15：只有**真的进入了 AOA accessory 模式**才值得把无线关掉。
+            //   10/25 的全量验证里，线插着但手机走的是 MTP/充电模式，connectType 恒为 1
+            //   （P2P），AOA 一次都没建起来；旧判据（任何 UsbDevice）却每次都停广播 10 秒，
+            //   冷启动因此白等 10~30 秒，还让角标误报「USB AOA 有线」。
+            if (!isAoaAccessoryPresent()) {
+                log("USB 优先：线已插但手机未进入 AOA 模式（MTP/充电），继续蓝牙广播");
+                return;
+            }
             if (sessionActive || castStarted) {
                 log("USB 优先：当前会话进行中，不打断（下次插拔或重连时生效）");
                 return;
@@ -240,7 +248,7 @@ public class IccoaManager {
     private final Runnable usbDetachDebounce = new Runnable() {
         @Override
         public void run() {
-            if (!usbPriority || adapter == null || isUsbAttached()) {
+            if (!usbPriority || adapter == null || isAoaAccessoryPresent()) {
                 return;
             }
             if (sessionActive || castStarted) {
@@ -778,17 +786,38 @@ public class IccoaManager {
     public String getTransportLabel() { return transportLabel; }
 
     /**
-     * 判定并上报当前数据通道（0.3.7）。
+     * 判定并上报当前数据通道（0.3.7；0.3.15 改为以 SDK 的 connectType 为准）。
      *
-     * <p>USB 优先；无线走 P2P 时尝试反射拿组频段（WifiP2pGroup.getFrequency 是
-     * hidden API），拿不到就只报 "P2P Wi-Fi"。
+     * <p>旧实现先看「有没有 USB 设备插着」——10/25 的全量验证因此大面积误报：
+     * 手机插着线充电、视频实际跑在 P2P 上（<code>[通道判定] connectType=1</code>），
+     * 角标却写「USB AOA 有线」。用户的观感就是「插过一次 USB 以后永远显示 USB」。
+     *
+     * <p>现在唯一的真相源是 {@code MobileDevice.getConnectType()}：
+     * 2 = AOA 有线、1 = P2P、3 = SoftAP；拿不到时才退回「AOA 配件是否真的在」。
      */
     private void resolveTransportLabel() {
-        String label;
-        if (isUsbAttached()) {
-            label = "USB AOA 有线";
-        } else {
-            label = "P2P Wi-Fi";
+        final int ct = stats.connectType;
+        if (ct == 3) {
+            transportLabel = "SoftAP Wi-Fi";
+            log("[通道] 当前数据通道：" + transportLabel);
+            try { listener.onTransportLabel(transportLabel); } catch (Throwable ignored) { }
+            return;
+        }
+        if (ct == 2) {
+            transportLabel = "USB AOA 有线";
+            log("[通道] 当前数据通道：" + transportLabel);
+            try { listener.onTransportLabel(transportLabel); } catch (Throwable ignored) { }
+            return;
+        }
+        if (ct != 1 && isAoaAccessoryPresent()) {
+            // connectType 读不到（dev=-1 的场次）但确实有 AOA 配件 → 按有线报
+            transportLabel = "USB AOA 有线";
+            log("[通道] 当前数据通道：" + transportLabel + "（connectType 未知，按 AOA 配件判定）");
+            try { listener.onTransportLabel(transportLabel); } catch (Throwable ignored) { }
+            return;
+        }
+        String label = "P2P Wi-Fi";
+        {
             try {
                 android.net.wifi.p2p.WifiP2pManager wm = (android.net.wifi.p2p.WifiP2pManager)
                         appCtx.getSystemService(Context.WIFI_P2P_SERVICE);
@@ -1118,8 +1147,8 @@ public class IccoaManager {
         //
         // ★ 必须带兜底：有些车机/线材只供电不跑 AOA 数据，这时如果不广播，手机永远
         //   发现不了车机，界面上连配对码都不会出现。所以 10 秒内没建链就退回广播。
-        if (usbPriority && isUsbAttached()) {
-            log("USB 优先：检测到 USB 配件，跳过蓝牙广播，只等 AOA 建链（10 秒无果则回退）");
+        if (usbPriority && isAoaAccessoryPresent()) {
+            log("USB 优先：检测到 AOA 配件，跳过蓝牙广播，只等 AOA 建链（10 秒无果则回退）");
             main.removeCallbacks(usbPriorityFallback);
             main.postDelayed(usbPriorityFallback, USB_PRIORITY_FALLBACK_MS);
             tryStartCast();
@@ -1392,7 +1421,8 @@ public class IccoaManager {
         final long timeout;
         if (everSurfaceReady) {
             timeout = SURFACE_READY_TIMEOUT_MS;
-        } else if (isUsbAttached()) {
+        } else if (isAoaAccessoryPresent()) {
+            // 0.3.15：只有真的 AOA 链路才给 USB 专用超时；线插着但走 Wi-Fi 时用常规窗口
             timeout = COLD_START_TIMEOUT_USB_MS;
         } else {
             timeout = COLD_START_TIMEOUT_MS;
@@ -1563,6 +1593,29 @@ public class IccoaManager {
         }
     }
 
+    /**
+     * 真的进入 AOA accessory 模式了吗（0.3.15）。
+     *
+     * <p>与 {@link #isUsbAttached()} 的区别是「插着线」和「真在走数据线」：
+     * 10/25 的全量验证里手机插着线但一直是 MTP/充电模式，
+     * {@code getAccessoryList()} 恒为空、SDK 的 connectType 恒为 1（P2P）。
+     * 凡是「USB 优先 / USB 专用超时窗口 / 角标通道」这类**会影响行为**的判断，
+     * 都必须用这个更严格的判据。
+     */
+    private boolean isAoaAccessoryPresent() {
+        try {
+            android.hardware.usb.UsbManager um =
+                    (android.hardware.usb.UsbManager) appCtx.getSystemService(Context.USB_SERVICE);
+            if (um == null) {
+                return false;
+            }
+            android.hardware.usb.UsbAccessory[] acc = um.getAccessoryList();
+            return acc != null && acc.length > 0;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     private void cancelEarlyBail() {
         main.removeCallbacks(earlyBailRunnable);
         earlyBailArmed = false;
@@ -1690,7 +1743,11 @@ public class IccoaManager {
             final long now = System.currentTimeMillis();
             // 新会话的首个进度事件有时是 10、有时是 20（取决于手机先报哪一步），
             // 所以用区间判断；0 不在此列 —— 那是断开，不该把本轮结果清掉。
-            if (progress > 0 && progress <= 20 && tProgress100 > 0L) {
+            // ★ 0.3.15：触发条件补上「上一场根本没走到 progress 100」。
+            //   旧条件只认 tProgress100 > 0，于是那些卡在 0/20/40 就死掉的场次
+            //   从不清零，下场的 onSurfaceReady 会算出「距 progress100 3117331ms」
+            //   这种 52 分钟的鬼数字（10/25 报告里成片出现），汇总也跟着失真。
+            if (progress > 0 && progress <= 20 && (tProgress100 > 0L || lastProgress <= 0)) {
                 // 新一轮会话，清掉上一轮的状态，避免汇总里串数据
                 tProgress90 = 0L;
                 tProgress100 = 0L;
@@ -1718,7 +1775,7 @@ public class IccoaManager {
             //      看门狗（progress 90 + 1300ms）按像素判据裁决。
             if (EARLY_BAIL_ENABLED && progress >= 10 && progress <= 20 && !handoffPrimed
                     && !everSurfaceReady && !earlyBailArmed && castStarted) {
-                if (isUsbAttached()) {
+                if (isAoaAccessoryPresent()) {
                     // USB 首连也是慢，但「慢」不等于「不出」：实测它能出画面，只是首帧晚。
                     // 掐断会给手机一次额外的 AOA 重协商，反而更慢，所以这里只放宽看门狗。
                     earlyBailArmed = true;
@@ -2057,6 +2114,14 @@ public class IccoaManager {
         if (count <= 0) {
             return;
         }
+        if (count >= 2) {
+            // 双指缩放/旋转这类手势能不能用，先看事件有没有真的发出去。
+            // 只记计数、不逐条打日志，避免把 UIBC 日志刷爆。
+            stats.multiTouchEvents++;
+            if (count > stats.multiTouchMax) {
+                stats.multiTouchMax = count;
+            }
+        }
 
         try {
             boolean ok = adapter.sendTouchEvent(action, count,
@@ -2137,7 +2202,8 @@ public class IccoaManager {
                 + " 触控=" + (fit == 1 ? "等比" : "拉伸")
                 + " 秒断=" + (EARLY_BAIL_ENABLED ? "开" : "关")
                 + " USB优先=" + (usbPriority ? "开" : "关")
-                + " | USB配件=" + (isUsbAttached() ? "已连接" : "未连接"));
+                + " | USB配件=" + (isAoaAccessoryPresent() ? "AOA已连接"
+                        : isUsbAttached() ? "已插线(非AOA)" : "未连接"));
         // UIBC 内部状态快照（反射读 SDK 的 UibcManager）：source=0x0 就是
         // 「触摸必然全被拒」的直接证据，省得下次再从行为反推。
         log("[能力] UIBC " + IccoaUibcFix.snapshot(adapter));
