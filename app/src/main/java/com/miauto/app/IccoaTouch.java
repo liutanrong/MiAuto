@@ -41,7 +41,10 @@ final class IccoaTouch {
         if (action != MotionEvent.ACTION_MOVE) {
             return false;
         }
-        if (now - lastMoveMs < 16L) {
+        // 0.3.16：16ms（≈60Hz）→ 20ms（50Hz）。拖动时 UIBC 每帧要组 JSON + 加密 + 走 RTP，
+        // 骁龙 665 上 60Hz 的触摸流会和视频解码抢 CPU，表现为「一边拖一边卡」。
+        // 50Hz 对手感几乎无感，但事件量少 20%。
+        if (now - lastMoveMs < 20L) {
             return true;
         }
         lastMoveMs = now;

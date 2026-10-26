@@ -735,6 +735,7 @@ public class IccoaManager {
         cancelCastStallWatchdog();
         logCapabilities();
         cancelGpsTick();
+        stopLinkStats();
         main.removeCallbacks(surfaceWatchdog);
         log("Surface 已销毁 → 状态清空");
     }
@@ -1312,6 +1313,7 @@ public class IccoaManager {
         castStarted = ok;
         if (ok) {
             startGpsTick();
+            startLinkStats();
             scheduleCastStallWatchdog();   // ★ 0.3.11：起投后 12s 无画面的兜底
             // USB（AOA）会话下 onWfdSinkReady 不触发，source size 停在 0，
             // 触摸会被 SDK 全拒；这里主动补一次（无线会话下补成 display 尺寸
@@ -1359,6 +1361,10 @@ public class IccoaManager {
                     lastFirstFrameMs = firstFrameFromStart
                             ? (now - tStartCast)
                             : (now - tProgress100);
+                    // ★ 0.3.16：这条路径也要记 stats —— 0.3.15 只在像素路径调了
+                    //   stats.onFirstFrame()，于是「onSurfaceReady 出画」的会话汇总里
+                    //   依然写「首帧=未就绪 / 结果=黑屏」（08:22 报告的最后一条就是）。
+                    stats.onFirstFrame();
                     main.post(listener::onFirstFrame);
                     log("★ onSurfaceReady() —— 首帧"
                             + (firstFrameFromStart ? "（早于 progress100）" : "")
@@ -2104,9 +2110,9 @@ public class IccoaManager {
         if (adapter == null || e == null) {
             return;
         }
-        final int action = e.getActionMasked();
+        final int maskedAction = e.getActionMasked();
         final long now = android.os.SystemClock.uptimeMillis();
-        if (touch.shouldDrop(action, now)) {
+        if (touch.shouldDrop(maskedAction, now)) {
             return;
         }
 
@@ -2124,13 +2130,36 @@ public class IccoaManager {
             }
         }
 
+        // ★ 0.3.16：双指手势的 action 必须带 pointer index。
+        //
+        //   Android 里 ACTION_POINTER_DOWN / UP 的真实值是 5|(index<<8) / 6|(index<<8)，
+        //   低 8 位之外那几位就是"第几根手指"。0.3.15 的 08:22 日志里 95 次双指事件
+        //   全部"已发送"，但用户实测双指缩放仍然无效 —— 因为我们传的是 masked 值（5/6，
+        //   index 恒为 0）：手机端解析成"第 0 根手指又按下一次"，第二根手指从未被登记，
+        //   于是单击正常、pinch 永远不成立。
+        //   现在改成带 index 的原始 action；若 SDK 拒收则自动退回 masked，保证不比原来差。
+        final int rawAction = e.getAction();
+        final boolean pointerEvent = maskedAction == android.view.MotionEvent.ACTION_POINTER_DOWN
+                || maskedAction == android.view.MotionEvent.ACTION_POINTER_UP;
+        final int wireAction = pointerEvent ? rawAction : maskedAction;
+
         try {
-            boolean ok = adapter.sendTouchEvent(action, count,
+            boolean ok = adapter.sendTouchEvent(wireAction, count,
                     touch.idsTrimmed(), touch.xsTrimmed(), touch.ysTrimmed());
+            if (!ok && pointerEvent && wireAction != maskedAction) {
+                // 老协议只认 masked 值时，退回原行为（至少单击不受影响）。
+                ok = adapter.sendTouchEvent(maskedAction, count,
+                        touch.idsTrimmed(), touch.xsTrimmed(), touch.ysTrimmed());
+                if (touch.takeLogSlot()) {
+                    log("[UIBC] 带 index 的多指 action 被拒 → 退回 masked=" + maskedAction);
+                }
+            }
             // ★ 成功也要记一条。只在失败时打日志的话，「触摸没反应」时无从判断
             //   到底是事件没到、还是到了但被 SDK 拒、还是送到了手机但手机没执行。
             if (touch.takeLogSlot()) {
-                log("触控回传 action=" + action + " count=" + count
+                log("触控回传 action=" + wireAction
+                        + (pointerEvent ? "(多指,index=" + (rawAction >> 8) + ")" : "")
+                        + " count=" + count
                         + " view=" + viewW + "x" + viewH
                         + " video=" + videoW + "x" + videoH
                         + (fit ? " 等比" : " 拉伸")
@@ -2144,7 +2173,7 @@ public class IccoaManager {
                 uibcFixBudget--;
                 log("[UIBC] 被拒快照 " + IccoaUibcFix.snapshot(adapter));
                 ensureUibcSourceSize("touch-rejected");
-                boolean retry = adapter.sendTouchEvent(action, count,
+                boolean retry = adapter.sendTouchEvent(wireAction, count,
                         touch.idsTrimmed(), touch.xsTrimmed(), touch.ysTrimmed());
                 log("[UIBC] 懒补后重发 → " + (retry ? "已发送" : "仍被拒")
                         + " | " + IccoaUibcFix.snapshot(adapter));
@@ -2323,6 +2352,80 @@ public class IccoaManager {
         }
         main.removeCallbacks(gpsTick);
         main.postDelayed(gpsTick, 2000L);
+    }
+
+    // ==================================================================
+    // 链路速率采样（0.3.16）
+    // ==================================================================
+
+    /**
+     * 每 5 秒读一次 p2p0 的 rx/tx 字节数，折成 Mbps 记一行。
+     *
+     * <p>「5GHz 会卡」这种主观描述需要一条可对照的曲线：720p60 的码流通常在
+     * 6~15 Mbps，如果采样值贴着这个上限反复见顶，卡顿就是带宽/空口问题（换信道、
+     * 降帧率有效）；如果速率远低于码流却仍在卡，问题在解码或渲染，不在网络。
+     * 采样本身只是两次 read，开销可忽略。
+     */
+    private static final long LINK_STATS_INTERVAL_MS = 5_000L;
+
+    private long linkRxPrev = -1L, linkTxPrev = -1L, linkTsPrev = 0L;
+    private int linkTick = 0;
+
+    private final Runnable linkStatsTick = new Runnable() {
+        @Override
+        public void run() {
+            if (!castStarted) return;
+            long now = System.currentTimeMillis();
+            long rx = readNetStat("rx_bytes");
+            long tx = readNetStat("tx_bytes");
+            if (rx >= 0 && tx >= 0 && linkRxPrev >= 0 && linkTsPrev > 0) {
+                double sec = (now - linkTsPrev) / 1000.0;
+                if (sec > 0.5) {
+                    double rxMbps = (rx - linkRxPrev) * 8 / sec / 1_000_000.0;
+                    double txMbps = (tx - linkTxPrev) * 8 / sec / 1_000_000.0;
+                    // 每 10 秒记一行，避免把日志刷成流量计
+                    if ((linkTick++ & 1) == 0) {
+                        log(String.format(java.util.Locale.US,
+                                "[链路] p2p0 收 %.1f Mbps / 发 %.1f Mbps", rxMbps, txMbps));
+                    }
+                }
+            }
+            linkRxPrev = rx;
+            linkTxPrev = tx;
+            linkTsPrev = now;
+            main.postDelayed(this, LINK_STATS_INTERVAL_MS);
+        }
+    };
+
+    /** 优先读 p2p0（无线直连），拿不到再退回 wlan0；两者都不可读时返回 -1。 */
+    private long readNetStat(String name) {
+        for (String iface : new String[]{"p2p0", "wlan0"}) {
+            try {
+                java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(
+                        "/sys/class/net/" + iface + "/statistics/" + name));
+                String line = r.readLine();
+                r.close();
+                if (line != null) {
+                    return Long.parseLong(line.trim());
+                }
+            } catch (Throwable ignored) {
+                // 权限或接口不存在 → 试下一个
+            }
+        }
+        return -1L;
+    }
+
+    private void startLinkStats() {
+        main.removeCallbacks(linkStatsTick);
+        linkRxPrev = -1L;
+        linkTxPrev = -1L;
+        linkTsPrev = 0L;
+        linkTick = 0;
+        main.postDelayed(linkStatsTick, LINK_STATS_INTERVAL_MS);
+    }
+
+    private void stopLinkStats() {
+        main.removeCallbacks(linkStatsTick);
     }
 
     private void cancelGpsTick() {

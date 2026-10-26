@@ -1,3 +1,17 @@
+# MiAuto 0.3.16 — 2026-10-26
+
+- **Pinch-to-zoom fixed (action now carries the pointer index).** The 08:22 log shows 95
+  two-finger events actually sent (`多点=95次/最多2指`) yet pinching did nothing: we sent the
+  masked value 5/6, whose index bits are always 0, so the phone parsed it as "pointer 0 down
+  again" and never registered the second finger. POINTER_DOWN/UP now send `getAction()`
+  (`5|index<<8`), falling back to the masked value if the SDK rejects it — taps unaffected.
+- **"结果=黑屏" fixed on the onSurfaceReady path too** (0.3.15 only recorded stats from the
+  pixel path, so SDK-reported first frames were still logged as black).
+- **5 GHz stutter is now measurable**: per-10 s `[链路] p2p0 rx/tx Mbps`, and a 30 s
+  `[流畅度]` probe reporting samples, changed frames, longest static gap and mean diff.
+- **Touch MOVE throttle 16 ms → 20 ms** (60 → 50 Hz): each UIBC event is JSON + encryption +
+  RTP; on the 665 that competes with decoding while dragging.
+
 # MiAuto 0.3.15 — 2026-10-26
 
 - **Channel badge now follows the SDK's connectType (fixes "once USB, always USB").**

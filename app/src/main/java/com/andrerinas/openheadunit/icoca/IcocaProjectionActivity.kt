@@ -140,6 +140,12 @@ class IcocaProjectionActivity : AppCompatActivity() {
 
                     if (state.castReady) {
                         stopPixelProbe()
+                        // 首帧之后跑一次流畅度采样（每个会话一次），给「卡不卡」一个客观数。
+                        if (!smoothStarted) {
+                            smoothStarted = true
+                            val sv = findViewById<SurfaceView>(R.id.icoca_surface)
+                            if (sv != null) startSmoothnessProbe(sv)
+                        }
                         // 首帧确认后把当前日夜模式同步给手机（只同步一次，避免每帧都发）。
                         if (!dayNightSynced) {
                             dayNightSynced = true
@@ -155,6 +161,8 @@ class IcocaProjectionActivity : AppCompatActivity() {
                     } else {
                         // 会话重建（如断开重连）会让 castReady 回到 false，此时重新开始采样，
                         // 否则遮罩只能等下一次 surfaceChanged 才可能被撤掉。
+                        smoothStarted = false
+                        stopSmoothnessProbe()
                         if (veil.visibility == View.GONE) startPixelProbe()
                         veil.animate().cancel()
                         veil.alpha = 1f
@@ -325,6 +333,94 @@ class IcocaProjectionActivity : AppCompatActivity() {
         probeHandler.removeCallbacks(probeRunnable)
     }
 
+    // ==================================================================
+    // 流畅度采样（0.3.16）
+    // ==================================================================
+
+    /**
+     * 首帧之后跑 30 秒「画面是否在变」的采样。
+     *
+     * <p>「5GHz 卡顿」这种体感需要一个客观数：每 250ms 抓一张 32×18 缩略图，和上一张比
+     * 平均像素差。差值 > 2 视为「这一拍画面变了」。视频正常播放时几乎每拍都在变；
+     * 掉帧/冻结会表现为连续多拍画面完全相同，最长静止时长就是最直观的卡顿指标。
+     *
+     * <p>开销：32×18 的 PixelCopy，4 次/秒，跑 30 秒即停 —— 比状态栏动画还便宜。
+     */
+    private val smoothHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var smoothStarted = false
+    private var smoothSamples = 0
+    private var smoothChanged = 0
+    private var smoothLastChangeAt = 0L
+    private var smoothLongestGap = 0L
+    private var smoothPrev: ByteArray? = null
+    private var smoothSumDiff = 0.0
+
+    private fun startSmoothnessProbe(sv: SurfaceView) {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.N) return
+        smoothSamples = 0
+        smoothChanged = 0
+        smoothSumDiff = 0.0
+        smoothLongestGap = 0L
+        smoothPrev = null
+        smoothLastChangeAt = android.os.SystemClock.elapsedRealtime()
+        smoothHandler.removeCallbacksAndMessages(null)
+        smoothHandler.postDelayed(object : Runnable {
+            override fun run() {
+                if (smoothSamples >= 120) {
+                    val avg = if (smoothSamples > 0) smoothSumDiff / smoothSamples else 0.0
+                    AppLog.i(String.format(java.util.Locale.US,
+                        "ICCOA projection: [流畅度] 30s 采样 %d 次，画面变化 %d 次，最长静止 %dms，平均差异 %.1f",
+                        smoothSamples, smoothChanged, smoothLongestGap, avg))
+                    return
+                }
+                sampleSmoothness(sv, this)
+                smoothHandler.postDelayed(this, 250L)
+            }
+        }, 300L)
+    }
+
+    private fun stopSmoothnessProbe() {
+        smoothHandler.removeCallbacksAndMessages(null)
+    }
+
+    private fun sampleSmoothness(sv: SurfaceView, next: Runnable) {
+        if (!sv.holder.surface.isValid) return
+        val bmp = android.graphics.Bitmap.createBitmap(32, 18, android.graphics.Bitmap.Config.ARGB_8888)
+        try {
+            android.view.PixelCopy.request(sv, bmp, { result ->
+                if (result == android.view.PixelCopy.SUCCESS) {
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    val cur = ByteArray(32 * 18)
+                    var i = 0
+                    for (y in 0 until 18) for (x in 0 until 32) {
+                        val c = bmp.getPixel(x, y)
+                        cur[i++] = (((c shr 16 and 0xFF) + (c shr 8 and 0xFF) + (c and 0xFF)) / 3).toByte()
+                    }
+                    val prev = smoothPrev
+                    smoothSamples++
+                    if (prev != null) {
+                        var diff = 0L
+                        for (k in cur.indices) {
+                            diff += kotlin.math.abs((cur[k].toInt() and 0xFF) - (prev[k].toInt() and 0xFF))
+                        }
+                        val avg = diff.toDouble() / cur.size
+                        smoothSumDiff += avg
+                        if (avg > 2.0) {
+                            smoothChanged++
+                            val gap = now - smoothLastChangeAt
+                            if (gap > smoothLongestGap) smoothLongestGap = gap
+                            smoothLastChangeAt = now
+                        }
+                    }
+                    smoothPrev = cur
+                }
+                bmp.recycle()
+            }, smoothHandler)
+        } catch (t: Throwable) {
+            bmp.recycle()
+        }
+    }
+
     private fun sampleOnce(sv: SurfaceView) {
         if (!sv.holder.surface.isValid) return
         // 采 64x36 就够：全黑判定不需要细节，小图能把 PixelCopy 的开销压到微秒级。
@@ -374,6 +470,7 @@ class IcocaProjectionActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
+        stopSmoothnessProbe()
         isForeground = false
         super.onStop()
     }
