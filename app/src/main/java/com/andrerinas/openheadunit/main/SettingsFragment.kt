@@ -1456,6 +1456,20 @@ class SettingsFragment : Fragment() {
             }
         ))
 
+        // ★ 0.3.17（A9）：优先 5GHz。只影响建组前的信道请求；建组后仍会校验实际频率，
+        //   落在 2.4G 只提示、不中断会话。写成即存，不必等底部「保存」。
+        val icocaPrefs = requireContext().getSharedPreferences("settings", Context.MODE_PRIVATE)
+        items.add(SettingItem.ToggleSettingEntry(
+            stableId = "icoca5gOnly",
+            nameResId = R.string.icoca_5g_only,
+            descriptionResId = R.string.icoca_5g_only_desc,
+            isChecked = icocaPrefs.getBoolean("icoca-5g-only", false),
+            onCheckedChanged = { isChecked ->
+                icocaPrefs.edit().putBoolean("icoca-5g-only", isChecked).apply()
+                updateSettingsList()
+            }
+        ))
+
         items.add(SettingItem.ToggleSettingEntry(
             stableId = "useMeasuredTouchSurface",
             nameResId = R.string.use_measured_touch_surface,

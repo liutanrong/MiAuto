@@ -76,19 +76,25 @@ class HomeFragment : Fragment() {
     private fun render(state: IcocaBridge.State) {
         val view = view ?: return
 
-        val status = when (state.phase) {
-            IcocaBridge.Phase.Idle,
-            IcocaBridge.Phase.Advertising -> getString(R.string.da_ready)
-
-            IcocaBridge.Phase.Pairing -> getString(R.string.da_connecting)
-            IcocaBridge.Phase.Connected -> getString(R.string.da_connected)
+        val status = when {
+            // ★ 0.3.17：停机态要说清楚"为什么没在等手机" —— 否则用户会以为车机坏了。
+            state.paused -> getString(R.string.icoca_paused_hint)
+            state.phase == IcocaBridge.Phase.Pairing -> getString(R.string.da_connecting)
+            state.phase == IcocaBridge.Phase.Connected -> getString(R.string.da_connected)
+            else -> getString(R.string.da_ready)
         }
-        view.findViewById<TextView>(R.id.connection_status)?.text = status
+        // 广播连续失败时补一句，用户知道车机还在自救，不必重启 App。
+        val withRetry = if (!state.paused && state.advertiseRetry > 0 &&
+            state.phase != IcocaBridge.Phase.Connected
+        ) {
+            "$status · " + getString(R.string.icoca_advertise_retry, state.advertiseRetry)
+        } else status
+        view.findViewById<TextView>(R.id.connection_status)?.text = withRetry
 
         // 通道标识（0.3.7）：把当前数据通道（USB AOA / P2P Wi-Fi 频段）拼在状态行，
         // 等待页就能回答"现在走的是哪条路"—— 上一次会话留下的 label 在新通道
         // 建立前仍然是最接近真实的描述，所以不清空。
-        val statusWithTransport = state.transport?.let { "$status · $it" } ?: status
+        val statusWithTransport = state.transport?.let { "$withRetry · $it" } ?: withRetry
         view.findViewById<TextView>(R.id.connection_status)?.text = statusWithTransport
 
         // Null-tolerant lookups: the layout has an orientation-specific variant, and a missing view

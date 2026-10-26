@@ -54,6 +54,10 @@ class IcocaBridge(context: Context) : IccoaManager.Listener {
          * the SDK stalls at 80% because there is no Surface, so it never reports Connected.
          */
         val progress: Int = 0,
+        /** 停机态（0.3.17）：用户/手机主动断开后不再自动回连，等用户点「刷新配对码/连接」。 */
+        val paused: Boolean = false,
+        /** 广播连续失败的重试次数（0.3.17）：>0 时等待页提示"蓝牙广播重试中（第 N 次）"。 */
+        val advertiseRetry: Int = 0,
         /**
          * 第一帧已经解码出来（SDK 的 onSurfaceReady）。
          *
@@ -118,9 +122,17 @@ class IcocaBridge(context: Context) : IccoaManager.Listener {
      * affordance, which must not behave like a power-off.
      */
     fun disconnectSession() {
-        AppLog.i("ICCOA: disconnectSession()")
-        manager.disconnectSession()
-        _state.update { it.copy(phase = Phase.Advertising, pinCode = null) }
+        AppLog.i("ICCOA: disconnectSession() — user intent, staying stopped")
+        // ★ 0.3.17：投屏页的「断开」是用户动作 —— 停广播、保持停机，不再自动回连。
+        manager.userDisconnect()
+        _state.update { it.copy(phase = Phase.Idle, pinCode = null, paused = true, progress = 0) }
+    }
+
+    /** 用户点「连接 / 刷新配对码」：退出停机态并重新广播。 */
+    fun resumeLink() {
+        AppLog.i("ICCOA: resumeLink()")
+        manager.resumeLink()
+        _state.update { it.copy(paused = false, phase = Phase.Advertising, pinCode = null, progress = 0) }
     }
 
     /**
@@ -176,10 +188,11 @@ class IcocaBridge(context: Context) : IccoaManager.Listener {
         //   紧跟在 progress 100 后面），那是状态机切换的过渡值，不是断开。原实现把所有
         //   未知码一律映射成 Advertising，结果画面已经投出来了，投屏页上还挂着
         //   「正在连接手机」，而且 phase 一变，MainActivity 的打开标志也被重置。
+        // ★ 0.3.17：按 SDK 真实语义映射（旧映射把 1=DISCONNECTED 当成了 Pairing）：
+        //   0/1/5 = 未连接（1 断开、5 投屏停止）→ 等待页；2/4 = 已连（含投屏已连）；3 = 失败。
         val phase = when (stateCode) {
-            0 -> Phase.Advertising
-            1, 2 -> Phase.Pairing
-            3 -> Phase.Connected
+            0, 1, 5, 3 -> Phase.Advertising
+            2, 4 -> Phase.Connected
             else -> null
         }
         AppLog.i("ICCOA: connection state $stateCode -> ${phase ?: "(keeping current)"}")
@@ -187,7 +200,21 @@ class IcocaBridge(context: Context) : IccoaManager.Listener {
             // 新会话开始/协商继续：清掉上一轮的丢链标志（投屏页据此不误退）
             _state.update { it.copy(linkLost = false) }
         }
+        if (stateCode == 2 || stateCode == 4) {
+            // 连上了：清掉广播重试计数与停机标记
+            _state.update { it.copy(advertiseRetry = 0, paused = false) }
+        }
         if (phase != null) updatePhase(phase)
+    }
+
+    override fun onPaused(paused: Boolean) {
+        AppLog.i("ICCOA: paused=$paused")
+        _state.update { it.copy(paused = paused) }
+    }
+
+    override fun onAdvertiseRetry(attempt: Int) {
+        AppLog.w("ICCOA: advertise retry #$attempt")
+        _state.update { it.copy(advertiseRetry = attempt) }
     }
 
     override fun onLinkLost() {

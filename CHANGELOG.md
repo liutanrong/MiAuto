@@ -1,3 +1,30 @@
+# MiAuto 0.3.17 — 2026-10-26
+
+**Batch A: connection stability (A1–A10)**
+
+- **Callback semantics fixed (A1, the root cause).** `onConnectStateChanged(deviceID, state, param)`:
+  the second argument is the state code, the third is extra info. We had been reading it as
+  `oldState -> newState`, so `state=1` (disconnected) was almost always dropped and `param=11`
+  (user-initiated disconnect) had no branch — the head unit kept believing a dead session was alive,
+  waiting for the 30 s refresh or the 45 s timeout. Now: 1=disconnected, 2=connected, 3=failed,
+  4=cast connected, 5=cast stopped, 6/7=phone home/foreground; state 5 defers 3 s for the reason
+  carried by state 1.
+- **Exponential backoff (A2)**: `ReconnectBackoff` 1.2 s, ×2, cap 8 s, only for 10003/10006/10008.
+- **No re-advertise during handshake + 90 s rescue (A3)**: re-advertising changes the broadcast
+  serial number, which *is* the pairing session id — it invalidated in-flight handshakes.
+- **Advertise self-healing (A4)**: retries 1.2/2.4/4.8/9.6 s instead of giving up after one failure.
+- **Unified `endSession()` (A5)** and **watchdog arbitration (A6)**: the 12 s stall watchdog yields
+  once progress hits 100, so one failure is no longer amplified into three rebuilds.
+- **Fallback BLE advertiser (A7)**: classic 31-byte advertising with the FCFB service UUID and the
+  SDK's serial mirrored; starts only when the SDK fails, no PIN within 8 s, or no advertise at all
+  after 5 s, and stops the moment the SDK succeeds.
+- **User disconnect stays stopped (A8)**: `param=11` or the disconnect button stops advertising and
+  waits for the user, showing "Disconnected · tap Refresh code to reconnect".
+- **5 GHz post-check, report-only (A9)**: reads the p2p0 frequency after the group is up, logs
+  `[5G] …`, and annotates the badge on 2.4 GHz without dropping the session; new "Prefer 5 GHz"
+  setting (default off, pre-group channel bias only).
+- **Single-line connection diagnostics (A10)**: `[连接] round N start/result/duration/phase`.
+
 # MiAuto 0.3.16 — 2026-10-26
 
 - **Pinch-to-zoom fixed (action now carries the pointer index).** The 08:22 log shows 95

@@ -37,6 +37,14 @@ public final class IccoaPrefs {
      */
     public static final String KEY_TOUCH_FIT = "touch-fit-mode";
 
+    /**
+     * 「优先 5GHz」（0.3.17）：广播前把 Wi-Fi Direct 工作信道偏置到 5GHz。
+     *
+     * <p>默认关。它只影响建组前的信道请求；建组后的实际频段另由
+     * {@code resolveTransportLabel()} 读 p2p0 校验，落在 2.4G 只提示、不中断会话。
+     */
+    public static final String KEY_5G_ONLY = "icoca-5g-only";
+
     /** P2 车联能力总开关：方控 / 日夜 / 车况回传。默认开。 */
     public static final String KEY_CAR_LINK = "iccoa-carlink";
 

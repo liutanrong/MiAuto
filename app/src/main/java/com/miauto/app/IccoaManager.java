@@ -107,6 +107,17 @@ public class IccoaManager {
 
         /** 当前数据通道的可读描述（"USB AOA 有线" / "P2P Wi-Fi 5GHz" 等）。默认空实现。 */
         default void onTransportLabel(String label) { }
+
+        /**
+         * 停机态变化（0.3.17）。
+         *
+         * <p>true = 用户/手机主动断开，车机已停止广播，等用户点「刷新配对码/连接」；
+         * false = 已退出停机，重新开始广播。
+         */
+        default void onPaused(boolean paused) { }
+
+        /** 广播连续失败的重试次数（0.3.17，A4）：UI 可据此提示"蓝牙广播重试中（第 N 次）"。 */
+        default void onAdvertiseRetry(int attempt) { }
     }
 
     private final Context appCtx;
@@ -123,9 +134,70 @@ public class IccoaManager {
     private int castRetry = 0;
 
     // ---- 状态机 ----
+    // ==================================================================
+    // SDK 连接状态码（0.3.17 修正）
+    // ==================================================================
+
+    /**
+     * {@code onConnectStateChanged(deviceID, state, param)} 的<b>真实</b>语义。
+     *
+     * <p>0.3.16 及以前，这段代码把第二个参数当成 "oldState"、第三个当成 "newState"，
+     * 于是所有分支实际是被 param 驱动的：state=1（断开）被漏掉、param=11（用户主动断开）
+     * 没有任何分支。直接后果是手机走了、车机还以为会话在跑，只能等 30 秒自动刷新或
+     * 45 秒协商超时 —— 也就是「最坏 30 秒、要手动介入」。
+     *
+     * <p>现在的映射（与社区 fork guo-zhc/MiAuto 的实测一致）：
+     * <pre>
+     *   1 DISCONNECTED        断开（param=11 表示用户/手机主动断开）
+     *   2 CONNECTED           已连接
+     *   3 CONNECT_FAILED      连接失败（param = 10003/10004/10006/10008 错误码）
+     *   4 CAST_CONNECTED      投屏已连接
+     *   5 CAST_DISCONNECTED   投屏已停止（param 恒为 -1，不带原因）
+     *   6/7                   手机回桌面 / 回前台
+     * </pre>
+     */
+    private static final int ST_DISCONNECTED = 1;
+    private static final int ST_CONNECTED = 2;
+    private static final int ST_CONNECT_FAILED = 3;
+    private static final int ST_CAST_CONNECTED = 4;
+    private static final int ST_CAST_DISCONNECTED = 5;
+    private static final int ST_PHONE_GO_HOME = 6;
+    private static final int ST_PHONE_BACK_FOREGROUND = 7;
+
+    /** SDK 的 {@code UCarConnectState.DISCONNECT_BY_USER}。 */
+    private static final int DISCONNECT_BY_USER = 11;
+
     private volatile boolean sdkInitialized = false;
     private volatile boolean sdkReady = false;
     private volatile boolean castStarted = false;
+
+    /**
+     * 用户/手机主动断开后的「停机」标志（0.3.17）。
+     *
+     * <p>置位后不再自动重播、不再自动回连，等待页提示「已断开 · 点刷新配对码重新连接」。
+     * 只有用户动作（刷新配对码 / 重新连接）才清除。
+     */
+    private volatile boolean paused = false;
+
+    /** 手机是否已进入握手（收到过任意 progress&gt;0）。握手期绝不重播（会换掉配对会话号）。 */
+    private volatile boolean negotiating = false;
+
+    /** 本会话内连续「无线建链类失败」次数，供 {@link ReconnectBackoff} 定档位。 */
+    private int wirelessFailStreak = 0;
+
+    /** state=5 之后等 state=1（带原因）的兜底计时。 */
+    private final Runnable castStopReconsiderRunnable = this::onCastStopNoReason;
+
+    /** 连接轮次诊断（A10）：每次重播 +1，连上/失败时打一行。 */
+    private int connectRound = 0;
+    private long connectRoundStartMs = 0L;
+
+    /** 兜底 BLE 广播器（A7）：SDK 广播发不出去时接管发现。 */
+    private FallbackBleAdvertiser fallbackAdv = null;
+    /** SDK 是否已经调用过 startAdvertise（用于 5 秒自救判定）。 */
+    private volatile boolean advertiseAttempted = false;
+    /** 广播失败重试计数（A4）。 */
+    private int advertiseRetryCount = 0;
     /** 上一次 init() 时实际采用的通道（native-ap-transport 的值），用于检测配置变更。 */
     private int appliedTransport = Integer.MIN_VALUE;
 
@@ -459,6 +531,17 @@ public class IccoaManager {
      */
     private final Runnable autoRefreshRunnable = () -> {
         if (!sdkReady || adapter == null) return;
+        if (paused) {
+            log("自动刷新：已停机，跳过本轮");
+            return;
+        }
+        if (negotiating) {
+            // ★ 0.3.17：握手期绝不重播。重播会换广播序列号（= 配对会话号），
+            //   手机端会把正在进行的握手当成另一个会话 —— 这就是"手机提示连接失败"的来源。
+            log("自动刷新：手机正在握手（" + lastProgress + "%），不打断");
+            scheduleAutoRefresh();
+            return;
+        }
         if (sessionActive || castStarted) {
             log("自动刷新：会话进行中，跳过本轮");
             scheduleAutoRefresh();
@@ -501,6 +584,37 @@ public class IccoaManager {
         reAdvertise();
         scheduleAutoRefresh();
     };
+
+    /**
+     * 协商自救（A3）：手机一旦开始握手就不再重播（重播会换掉广播序列号 = 配对会话号，
+     * 正在进行的握手会被手机端当成另一个会话）。但握手也可能无疾而终，所以留一条 90 秒的
+     * 自救通道 —— 到点还没连上，才允许重新广播一次。
+     */
+    private static final long NEGOTIATION_RESCUE_MS = 90_000L;
+
+    private final Runnable negotiationRescueRunnable = () -> {
+        if (paused) {
+            log("协商自救：已停机，跳过");
+            return;
+        }
+        if (sessionActive || surfaceReady) {
+            log("协商自救：已连上，跳过");
+            return;
+        }
+        log("★ 协商中断自救：握手超过 " + (NEGOTIATION_RESCUE_MS / 1000) + " 秒无结果 → 重播一次");
+        negotiating = false;
+        logConnectRoundResult("协商超时自救");
+        reAdvertise();
+    };
+
+    private void armNegotiationRescue() {
+        main.removeCallbacks(negotiationRescueRunnable);
+        main.postDelayed(negotiationRescueRunnable, NEGOTIATION_RESCUE_MS);
+    }
+
+    private void cancelNegotiationRescue() {
+        main.removeCallbacks(negotiationRescueRunnable);
+    }
 
     private void scheduleConnectingTimeout() {
         main.removeCallbacks(connectingTimeoutRunnable);
@@ -829,17 +943,23 @@ public class IccoaManager {
                     wm.requestGroupInfo(ch, group -> {
                         String l = "P2P Wi-Fi";
                         if (group != null) {
+                            int freq = -1;
                             try {
                                 Object f = group.getClass().getMethod("getFrequency").invoke(group);
-                                int freq = (Integer) f;
+                                freq = (Integer) f;
                                 if (freq >= 4900) {
                                     l = "P2P Wi-Fi 5GHz";
                                 } else if (freq > 0) {
-                                    l = "P2P Wi-Fi 2.4GHz";
+                                    // ★ 0.3.17（A9）：只提示、不打断 —— 2.4G 不代表连不上，
+                                    //   但它是「5GHz 还卡」最重要的归因线索：真跑在 2.4G 上，
+                                    //   卡顿就有答案了（信道拥挤 + 带宽只有 5G 的零头）。
+                                    l = "P2P Wi-Fi 2.4GHz（建议改 5G）";
                                 }
                             } catch (Throwable ignored) {
                                 // hidden API 被裁剪就退回无频段的描述
                             }
+                            log("[5G] 组频段=" + (freq > 0 ? freq + "MHz" : "读不到")
+                                    + " 判定=" + (freq >= 4900 ? "5G" : freq > 0 ? "2.4G" : "未知"));
                         }
                         transportLabel = l;
                         log("[通道] 当前数据通道：" + l);
@@ -1033,8 +1153,17 @@ public class IccoaManager {
                     log("✗ enableUsbDeviceDetection 失败: " + t);
                 }
 
+                startConnectRound("初始化成功");
                 main.post(() -> safe("doAdvertise", IccoaManager.this::doAdvertise));
                 main.post(IccoaManager.this::scheduleAutoRefresh);   // ★ 启动配对码看门狗
+                // ★ 0.3.17（A7）：SDK 初始化成功却迟迟没走到广播（原生库/线程异常），
+                //   5 秒后由兜底广播接管发现 —— 否则手机上永远搜不到车机。
+                main.postDelayed(() -> {
+                    if (!advertiseAttempted && !paused) {
+                        log("! 初始化 5s 仍未广播 → 兜底广播接手");
+                        ensureFallbackAdvertise("SDK 5s 未广播");
+                    }
+                }, 5000L);
             }
 
             @Override
@@ -1060,6 +1189,12 @@ public class IccoaManager {
      */
     private void reAdvertise() {
         if (adapter == null) return;
+        if (paused) {
+            log("重播被拒：当前处于停机态（等用户点连接）");
+            return;
+        }
+        startConnectRound("重新广播");
+        fallbackStarted = false;
         try {
             adapter.registerCarConnectListener(connectListener);
             adapter.registerPhoneDataListener(phoneDataListener);
@@ -1085,6 +1220,11 @@ public class IccoaManager {
             log("刷新失败：SDK 尚未就绪");
             return;
         }
+        // 用户的明确动作：无论此前是否停机，都恢复广播。
+        if (paused) log("■ 手动刷新 → 退出停机态");
+        paused = false;
+        wirelessFailStreak = ReconnectBackoff.resetStreak();
+        try { listener.onPaused(false); } catch (Throwable ignored) { }
         reAdvertise();
         scheduleAutoRefresh();
     }
@@ -1103,6 +1243,10 @@ public class IccoaManager {
         main.removeCallbacks(reAdvertiseRunnable);
         main.removeCallbacks(usbPriorityFallback);
         cancelAutoRefresh();
+        cancelNegotiationRescue();
+        main.removeCallbacks(advertiseRetryRunnable);
+        main.removeCallbacks(castStopReconsiderRunnable);
+        if (fallbackAdv != null) fallbackAdv.stop();
         unregisterUsbReceiver();
         sessionActive = false;
         castStarted = false;
@@ -1116,6 +1260,122 @@ public class IccoaManager {
      *
      * <p>与 {@link #stop()} 的区别：{@code stop()} 会停掉广播（相当于彻底关机位），
      * 本方法只拆会话，车机仍可被发现。
+     */
+    // ==================================================================
+    // 会话生命周期（0.3.17）
+    // ==================================================================
+
+    /**
+     * 统一收口：任何一条路径判定"会话结束"都走这里。
+     *
+     * <p>旧实现里清状态的代码散在 6 个分支里，漏一处就会出现「手机都走了、车机还以为会话在跑」，
+     * 于是 30 秒自动刷新一直打印「会话进行中，跳过本轮」，用户只能重启 App。
+     */
+    private void endSession(String reason) {
+        sessionActive = false;
+        negotiating = false;
+        castStarted = false;
+        surfaceReady = false;
+        castRebuildCount = 0;
+        lastPinCode = null;
+        cancelEarlyBail();
+        cancelCastStallWatchdog();
+        cancelConnectingTimeout();
+        cancelNegotiationRescue();
+        main.removeCallbacks(surfaceWatchdog);
+        linkLostArmed = false;
+        main.removeCallbacks(linkLostRunnable);
+        log("· 会话清理（" + reason + "）");
+    }
+
+    /**
+     * 进入「停机」：用户/手机主动断开后不再自动回连（0.3.17 的明确决策）。
+     *
+     * <p>只停广播、不动 SDK 之外的东西；用户点「刷新配对码」或主页「连接」即恢复。
+     */
+    private void enterPaused(String why) {
+        paused = true;
+        sessionActive = false;
+        negotiating = false;
+        lastPinCode = null;
+        main.removeCallbacks(reAdvertiseRunnable);
+        main.removeCallbacks(autoRefreshRunnable);
+        main.removeCallbacks(usbPriorityFallback);
+        try {
+            if (adapter != null) adapter.stopAdvertise();
+        } catch (Throwable ignored) {
+        }
+        if (fallbackAdv != null && fallbackAdv.isRunning()) fallbackAdv.stop();
+        log("■ 已停机（" + why + "）→ 不再自动重播，等用户点「刷新配对码/连接」");
+        try { listener.onPaused(true); } catch (Throwable ignored) { }
+        // 手机端主动断开时投屏页还停在最后一帧，必须让它退回等待页（否则画面看着像卡死）。
+        main.post(() -> { try { listener.onLinkLost(); } catch (Throwable ignored) { } });
+    }
+
+    /** 用户动作恢复：清停机标志并重播。主页「连接」「刷新配对码」走这里。 */
+    public void resumeLink() {
+        if (!sdkReady || adapter == null) {
+            log("恢复连接失败：SDK 尚未就绪");
+            return;
+        }
+        if (paused) log("■ 用户要求恢复连接 → 退出停机态");
+        paused = false;
+        wirelessFailStreak = ReconnectBackoff.resetStreak();
+        try { listener.onPaused(false); } catch (Throwable ignored) { }
+        reAdvertise();
+        scheduleAutoRefresh();
+    }
+
+    /** 连接轮次计时起点（每次重播/起播算一轮）。 */
+    private void startConnectRound(String why) {
+        connectRound++;
+        connectRoundStartMs = System.currentTimeMillis();
+        log("[连接] 第 " + connectRound + " 轮开始（" + why + "）");
+    }
+
+    private void logConnectRoundResult(String result) {
+        long ms = connectRoundStartMs == 0L ? -1L : System.currentTimeMillis() - connectRoundStartMs;
+        log("[连接] 第 " + connectRound + " 轮结果=" + result
+                + (ms >= 0 ? " 用时=" + ms + "ms" : "") + " 阶段=" + lastProgress + "%");
+    }
+
+    /**
+     * state=5（投屏已停止）之后 3 秒仍没等到 DISCONNECTED(1) 的兜底处理。
+     *
+     * <p>state=5 的 param 恒为 -1，单看它分不清「抖动」还是「用户断开」。正常情况下
+     * 手机/用户主动断开会在毫秒级内补一条 state=1 + param=11；等不到就说明是异常断链。
+     */
+    private void onCastStopNoReason() {
+        if (!castStarted && !sessionActive) return;
+        if (paused) {
+            log("· CAST_DISCONNECTED 后 3s 无原因，但已停机 → 不再重播");
+            return;
+        }
+        log("★ CAST_DISCONNECTED 后 3s 仍无 DISCONNECTED(1) → 按异常断连处理");
+        endSession("投屏停止无原因");
+        logConnectRoundResult("投屏停止无原因");
+        scheduleReAdvertise(ReconnectBackoff.nextDelayMs(false, 0));
+        scheduleAutoRefresh();
+    }
+
+    /**
+     * 僵死画面防护：画面曾经出来过、链路却掉了 → 2 秒确认窗后退出投屏页。
+     * 只认 state=1/5（旧代码看的 "-1" 是 param，等于从来没真正触发过）。
+     */
+    private void armLinkLostIfNeeded(int state) {
+        if (castStarted && everSurfaceReady && !linkLostArmed
+                && (state == ST_DISCONNECTED || state == ST_CAST_DISCONNECTED)) {
+            linkLostArmed = true;
+            log("· 画面曾出过、链路断开 → 2 秒内未恢复则退出投屏页（僵死防护）");
+            main.postDelayed(linkLostRunnable, 2000L);
+        }
+    }
+
+    /**
+     * 本端断开当前会话（自动恢复路径用）。
+     *
+     * <p>投屏页的「断开」按钮走 {@link #userDisconnect()}：那是人的决定，必须停机。
+     * 本方法只给看门狗/重播链路用，断完会重新广播。
      */
     public void disconnectSession() {
         log("=== 断开当前会话（保持广播）===");
@@ -1138,6 +1398,20 @@ public class IccoaManager {
         scheduleAutoRefresh();
     }
 
+    /**
+     * 用户主动断开（投屏页「断开」按钮 / 主页停止）。
+     *
+     * <p>0.3.17 的明确决策：用户断开后<b>保持停机</b>，不再自动重播、不再自动回连 ——
+     * 旧实现断完 5 秒又广播，手机端 CarWith 立刻把车机连回来，用户看到的就是「点了断开又连上」。
+     */
+    public void userDisconnect() {
+        log("=== 用户主动断开（保持停机）===");
+        try { if (adapter != null) adapter.pauseCast(false); } catch (Throwable ignored) { }
+        try { if (adapter != null) adapter.disconnect(); } catch (Throwable ignored) { }
+        endSession("用户主动断开");
+        enterPaused("用户主动断开");
+    }
+
     // ==================================================================
     // 广播 / 投屏
     // ==================================================================
@@ -1157,8 +1431,21 @@ public class IccoaManager {
             return;
         }
 
+        advertiseAttempted = true;
+        biasP2pTo5gIfRequested();
         boolean ok = adapter.startAdvertise();
         log((ok ? "✓ " : "✗ ") + "startAdvertise() = " + ok);
+        if (!ok) {
+            onAdvertiseFailed("startAdvertise 返回 false");
+        } else {
+            advertiseRetryCount = 0;
+            // SDK 广播成功了，兜底广播必须让位，避免手机看到两个同源广播
+            if (fallbackAdv != null && fallbackAdv.isRunning()) {
+                log("SDK 广播已成功 → 停止兜底广播");
+                fallbackAdv.stop();
+            }
+            fallbackStarted = false;
+        }
         if (ok) {
             // ★ 预热必须排在广播**之后**。
             //   startCast 与 startAdvertise 都排在 SDK 同一个 worker 线程上；如果先把
@@ -1192,6 +1479,100 @@ public class IccoaManager {
      */
     private int pinRetryCount = 0;
 
+    // ==================================================================
+    // 广播失败自愈 + 兜底广播（0.3.17 的 A4 / A7）
+    // ==================================================================
+
+    private boolean fallbackStarted = false;
+
+    private final Runnable advertiseRetryRunnable = () -> {
+        if (paused || adapter == null) return;
+        if (sessionActive || castStarted) return;
+        log("广播重试（第 " + (advertiseRetryCount + 1) + " 次）");
+        doAdvertise();
+    };
+
+    /**
+     * SDK 广播失败后的自愈：1.2s → 2.4s → 4.8s → 9.6s，最长 10s，永不放弃。
+     *
+     * <p>旧实现在这里只打一行日志就结束了，而 pinWatchdog 又只在"成功路径"排程、
+     * 两次后放弃 —— 一次 startAdvertise 失败就等于整台车机失联，只能重启 App。
+     * 10/25 的 6 次「回退广播 失败」全都是这么卡死的。
+     */
+    private void onAdvertiseFailed(String why) {
+        advertiseRetryCount++;
+        long delay = Math.min(1200L * (1L << Math.min(advertiseRetryCount - 1, 3)), 10_000L);
+        log("✗ 广播失败（" + why + "，连续第 " + advertiseRetryCount + " 次）→ " + delay + "ms 后重试");
+        try { listener.onAdvertiseRetry(advertiseRetryCount); } catch (Throwable ignored) { }
+        // 连续失败时同时拉起兜底广播：SDK 的扩展广播在某些蓝牙栈上"返回成功但发不出去"，
+        // 这条路径只能靠传统 31 字节广播补上。
+        if (advertiseRetryCount >= 2) {
+            ensureFallbackAdvertise("SDK 广播连续失败");
+        }
+        main.removeCallbacks(advertiseRetryRunnable);
+        main.postDelayed(advertiseRetryRunnable, delay);
+    }
+
+    /**
+     * 「优先 5GHz」的建组前偏置（0.3.17，A9）。
+     *
+     * <p>用隐藏 API {@code WifiP2pManager.setWifiP2pChannels} 把整机 P2P 工作信道限制到
+     * 149（UNII-3）。这是<b>尽力而为</b>：SDK 建组时可能自己复位信道，抹掉这层限制 ——
+     * 抹掉了就退化成"不干预"，绝不会让连接失败。建组后的真实频段另由
+     * {@link #resolveTransportLabel()} 事后校验。
+     */
+    private void biasP2pTo5gIfRequested() {
+        if (!IccoaPrefs.getBool(appCtx, IccoaPrefs.KEY_5G_ONLY, false)) return;
+        try {
+            android.net.wifi.p2p.WifiP2pManager wm =
+                    (android.net.wifi.p2p.WifiP2pManager) appCtx.getSystemService(Context.WIFI_P2P_SERVICE);
+            if (wm == null) {
+                log("[5G] 偏置跳过：WifiP2pManager 不可用");
+                return;
+            }
+            android.net.wifi.p2p.WifiP2pManager.Channel ch =
+                    wm.initialize(appCtx, main.getLooper(), null);
+            if (ch == null) {
+                log("[5G] 偏置跳过：Channel 初始化失败");
+                return;
+            }
+            java.lang.reflect.Method m = wm.getClass().getMethod("setWifiP2pChannels",
+                    android.net.wifi.p2p.WifiP2pManager.Channel.class,
+                    int.class, int.class,
+                    android.net.wifi.p2p.WifiP2pManager.ActionListener.class);
+            m.invoke(wm, ch, 0, 149, new android.net.wifi.p2p.WifiP2pManager.ActionListener() {
+                @Override public void onSuccess() { log("[5G] 工作信道偏置已下发：149 (UNII-3)"); }
+                @Override public void onFailure(int reason) { log("[5G] 工作信道偏置被拒 reason=" + reason); }
+            });
+        } catch (Throwable t) {
+            log("[5G] 工作信道偏置不可用（隐藏 API 被裁剪）: " + t);
+        }
+    }
+
+    /**
+     * 拉起兜底 BLE 广播（{@link FallbackBleAdvertiser}）。
+     *
+     * <p>延迟 800ms 是必需的：序列号由 SDK 在构建广播数据时写进 {@code serial_num_prefs}，
+     * 两条广播必须镜像同一个序列号 —— 否则手机端会把同一台车看成两个配对会话。
+     */
+    private void ensureFallbackAdvertise(String why) {
+        if (paused || fallbackStarted) return;
+        fallbackStarted = true;
+        if (fallbackAdv == null) {
+            fallbackAdv = new FallbackBleAdvertiser(appCtx, this::log);
+        }
+        log("→ 启动兜底 BLE 广播（" + why + "）");
+        main.postDelayed(() -> {
+            if (paused) return;
+            try {
+                fallbackAdv.start(generateCarId(), sessionActive);
+            } catch (Throwable t) {
+                log("✗ 兜底广播启动异常: " + t);
+                fallbackStarted = false;
+            }
+        }, 800L);
+    }
+
     private void schedulePinWatchdog() {
         main.removeCallbacks(pinWatchdog);
         pinRetryCount = 0;
@@ -1202,12 +1583,22 @@ public class IccoaManager {
         @Override
         public void run() {
             if (lastPinCode != null) return;      // 已经有码，正常
-            if (pinRetryCount >= 2) {
-                log("✗ 8s 内两次重播都没有配对码，停止重试（检查蓝牙广播能力）");
+            if (paused) return;                    // 停机态不重播
+            if (negotiating) {                     // 握手期重播 = 打断配对会话
+                log("配对码看门狗：手机正在握手，跳过重播");
+                main.postDelayed(pinWatchdog, 8000L);
+                return;
+            }
+            if (pinRetryCount >= 6) {
+                log("✗ 连续 6 次重播都没有配对码，交给兜底广播/长退避（不再放弃）");
                 return;
             }
             pinRetryCount++;
             log("✗ 8s 未收到配对码 → 重新广播（第 " + pinRetryCount + " 次）");
+            if (pinRetryCount == 1) {
+                // SDK 认为广播成功、却迟迟没有配对码：典型是"扩展广播发不出去"的老蓝牙栈。
+                ensureFallbackAdvertise("8s 无配对码");
+            }
             try {
                 if (adapter != null) adapter.stopAdvertise();
             } catch (Throwable ignored) {
@@ -1499,8 +1890,15 @@ public class IccoaManager {
         @Override
         public void run() {
             if (!castStarted || surfaceReady) return;
+            // ★ 0.3.17 看门狗互斥（A6）：只要协商已经走到 100%，首帧判定就归 4s 那条链管，
+            //   这里立即让位。旧实现两条闸同时开火：先断会话、再重绑、再断 —— 一次故障被
+            //   放大成 3 次重建，用户看到的就是"一直在重建"。
+            if (tProgress100 > 0L) {
+                log("· 起投看门狗让位：协商已到 100%，首帧由 4s 链负责");
+                return;
+            }
             log("✗ 起投 " + (CAST_STALL_TIMEOUT_MS / 1000) + "s 仍无画面"
-                    + "（协商可能卡在中途，lastProgress=" + lastProgress + "）→ 断会话重播");
+                    + "（协商卡在中途，lastProgress=" + lastProgress + "）→ 断会话重播");
             main.post(listener::onRecovering);
             stats.reconnectCount++;
             try {
@@ -1645,91 +2043,108 @@ public class IccoaManager {
         }
 
         @Override
-        public void onConnectStateChanged(String deviceID, int oldState, int newState) {
+        public void onConnectStateChanged(String deviceID, int state, int param) {
             if (deviceID != null && !"-1".equals(deviceID) && !deviceID.isEmpty()) {
                 lastDeviceId = deviceID;
             }
-            // ★ 带上 deviceID。多台手机同时在场时，光看状态码分不清是「同一台在重试」
-            //   还是「不同设备在互相顶掉」——这两者的处理方式完全不同。
+            // ★ 0.3.17：真正按 SDK 的语义打日志 —— state 是状态码，param 是附加信息。
+            //   旧写法把它当成 oldState -> newState，导致断开事件被当成"未知状态"漏掉。
             log("onConnectStateChanged dev=" + shortId(deviceID)
-                    + " " + stateName(oldState) + " -> " + stateName(newState));
-            if (newState == 0 && oldState != 0) {
-                // 会话真正结束（不是启动时的初始 DISCONNECTED）。清掉已过期的配对码并延时重新
-                // 广播：手机端 CarWith 会重新发现车机并触发一次全新配对（新的 onPinCode）。
-                sessionActive = false;
-                lastPinCode = null;
-                castStarted = false;
-                cancelConnectingTimeout();
-                scheduleReAdvertise();
-                scheduleAutoRefresh();
-            } else if (newState == 1) {
-                main.removeCallbacks(usbPriorityFallback);
-                // ★ 协商中：也要置 sessionActive，否则 30 秒看门狗会在鉴权进行到一半时
-                //   stop→start 重播，把正在跑的会话连根拔掉（实测 vivo 上就是卡在这一步）。
-                //   改用更长的 CONNECTING_TIMEOUT 兜底，超时才放开。
-                sessionActive = true;
-                main.removeCallbacks(reAdvertiseRunnable);
-                // 新会话开始，首屏看门狗的重建次数必须归零 —— 否则上一轮断开前的
-                // 计数会让这一轮刚开始就直接跳到最后一步。
-                castRebuildCount = 0;
-                surfaceReady = false;
-                scheduleConnectingTimeout();
-            } else if (newState == 2 || newState == 3) {
-                // 已连上：撤销任何待执行的重新广播，免得刚连上就被重启广播打断；看门狗也会因此空转。
-                sessionActive = true;
-                cancelConnectingTimeout();
-                main.removeCallbacks(reAdvertiseRunnable);
-            } else if (newState >= 10000) {
-                // 10003 / 10004 / 10008 —— SDK 的 handleConnectFailed() 三个失败分支
-                // （分别对应 USB / P2P / SoftAP 建链失败）。这些不是 0/1/2/3 状态，
-                // 落到这里必须清掉会话标记，否则看门狗会一直以为「正在协商」而永不重播。
-                String hint = (appliedTransport == 1)
-                        ? "（SoftAP 模式：车机系统热点必须处于开启状态 —— SDK 拿不到 TETHER_PRIVILEGED，"
-                          + "无法自己开热点；如果热点本来就没开，请改用 WiFi Direct）"
-                        : "（P2P 模式：检查车机 Wi-Fi 是否被其它连接占用、手机端是否允许 Wi-Fi Direct）";
-                log("✗ 连接失败码 " + newState + " → 交回看门狗，准备重播 " + hint);
-                sessionActive = false;
-                castStarted = false;
-                cancelConnectingTimeout();
-                if (newState == 10008) {
-                    // 10008 总是紧跟在 startAdvertise() 之后出现，是「本端刚重启广播，
-                    // 上一个会话因此作废」的回声，不是手机侧的新失败。再触发一次重播
-                    // 只会制造 1.2 秒级的自我循环（日志里 10003→重播→10008→重播）。
-                    log("  （10008 为重播回声，跳过再次重播）");
-                    scheduleAutoRefresh();
-                } else {
-                    scheduleReAdvertise();
-                    scheduleAutoRefresh();
+                    + " state=" + state + "(" + stateName(state) + ") param=" + param
+                    + (param >= 10000 ? "(" + ReconnectBackoff.errorName(param) + ")" : ""));
+
+            switch (state) {
+                case ST_CONNECTED:
+                case ST_CAST_CONNECTED: {
+                    // 真连上：撤销所有待执行的重播/超时，握手结束，退避复位。
+                    main.removeCallbacks(reAdvertiseRunnable);
+                    main.removeCallbacks(castStopReconsiderRunnable);
+                    cancelConnectingTimeout();
+                    cancelNegotiationRescue();
+                    negotiating = false;
+                    sessionActive = true;
+                    paused = false;
+                    wirelessFailStreak = ReconnectBackoff.resetStreak();
+                    castRebuildCount = 0;
+                    logConnectRoundResult("成功");
+                    // SDK 建链成功后会自己 stopAdvertise()，兜底广播必须同步停，
+                    // 否则手机端会把同一台车当成"可连接的陌生设备"反复重扫。
+                    if (fallbackAdv != null && fallbackAdv.isRunning()) {
+                        log("会话已建立 → 停止兜底广播");
+                        fallbackAdv.stop();
+                    }
+                    // 连上就刷新一次通道标签：顺带做 5G 事后校验（A9）。
+                    resolveTransportLabel();
+                    break;
                 }
-            }
-            // ★ 僵死画面防护（0.3.7，0.3.8 放宽）。实测真实断联时 deviceID 往往仍是
-            //   有效值（dev=099b29），只有状态机掉回 STATE_-1 —— 原来的
-            //   "-1".equals(deviceID) 条件导致防护从不触发，车机停在最后一帧。
-            //   现改为：只要投屏已开始、状态掉回 -1（无论标识是否还在），就开 2 秒
-            //   确认窗；窗口内手机重连/协商推进（state 1..3 或 connecting progress>0）
-            //   即撤销。本端主动断开不受影响（disconnectSession 先清 castStarted）。
-            // ★ 僵死画面防护（0.3.10 修正判据）。SDK 在 progress 100 之后必然回调一次
-            //   CONNECTED -> STATE_-1 的过渡值（实测每个正常会话都有，首帧都出了它也来），
-            //   且此时 progress 已到顶、不会再有事件来撤销 —— 0.3.9 在这里 2 秒后必误杀，
-            //   造成「连上 2 秒 → 退出 → 手机还在 → 自动重连 → 再杀」的无限循环。
-            //   判据：距 progress 100 不足 3 秒的 -1 一律视为过渡值跳过；稳态期的 -1
-            //   （真丢链）才武装 2 秒确认窗。
-            long sinceP100 = tProgress100 == 0L ? Long.MAX_VALUE
-                    : System.currentTimeMillis() - tProgress100;
-            if (castStarted && everSurfaceReady && newState == -1 && !linkLostArmed) {
-                if (sinceP100 < 3000L) {
-                    log("· CONNECTED 后的过渡 STATE_-1（距 progress100 " + sinceP100 + "ms），跳过僵死判定");
-                } else {
-                    linkLostArmed = true;
-                    log("· 稳态期连接状态掉回 STATE_-1，2 秒内未恢复则退出投屏页（僵死防护）");
-                    main.postDelayed(linkLostRunnable, 2000L);
+
+                case ST_CONNECT_FAILED: {
+                    log("✗✗ 连接失败：错误码 " + param + "（" + ReconnectBackoff.errorName(param) + "）"
+                            + "；中止于阶段 " + lastProgress + "%");
+                    endSession("连接失败 code=" + param);
+                    logConnectRoundResult("失败 code=" + param);
+                    if (paused) {
+                        log("（已停机，不再重播）");
+                        break;
+                    }
+                    // 无线建链类失败 → 指数退避，给 P2P 组一个干净回收的窗口；
+                    // 其它错误码与射频无关，固定 base 间隔即可。
+                    wirelessFailStreak = ReconnectBackoff.streakAfterFailure(wirelessFailStreak, param);
+                    boolean wireless = ReconnectBackoff.isWirelessBringupFailure(param);
+                    long delay = ReconnectBackoff.nextDelayMs(wireless, wirelessFailStreak);
+                    if (wireless && delay > ReconnectBackoff.BASE_MS) {
+                        log("  ↳ 连续无线建链失败 " + wirelessFailStreak + " 次 → 退避 "
+                                + delay + "ms 后重播，等 P2P 组干净回收");
+                    }
+                    scheduleReAdvertise(delay);
+                    scheduleAutoRefresh();
+                    break;
                 }
-            } else if (newState >= 1 && newState <= 3) {
-                // 会话恢复（手机重连/协商继续），撤销待发的丢链判定
-                linkLostArmed = false;
-                main.removeCallbacks(linkLostRunnable);
+
+                case ST_CAST_DISCONNECTED:
+                    // param 恒为 -1（onWfdSinkStopped 不带原因），无法区分"抖动"与"用户断开"。
+                    // 先挂 3 秒，等随后到达的 DISCONNECTED(1) 带上 param=11；等不到再按异常处理。
+                    main.removeCallbacks(castStopReconsiderRunnable);
+                    main.postDelayed(castStopReconsiderRunnable, 3000L);
+                    armLinkLostIfNeeded(state);
+                    break;
+
+                case ST_DISCONNECTED: {
+                    main.removeCallbacks(castStopReconsiderRunnable);
+                    // SDK 初始化后可能先补一条"当前就是断开"的初始状态（param 常为 0）。
+                    // 那时既没起投也没握过手，重播只会白白换掉刚下发的配对码。
+                    if (!sessionActive && !castStarted && tStartCast == 0L) {
+                        log("· 初始 DISCONNECTED（尚未建链），忽略");
+                        break;
+                    }
+                    boolean byUser = (param == DISCONNECT_BY_USER);
+                    log("会话断开（param=" + param + "，" + (byUser ? "用户/手机主动断开" : "异常断连") + "）");
+                    // 先判僵死（要用 castStarted/everSurfaceReady），再清状态
+                    armLinkLostIfNeeded(state);
+                    endSession(byUser ? "用户主动断开" : "异常断连");
+                    logConnectRoundResult(byUser ? "用户断开" : "异常断连");
+                    if (byUser || paused) {
+                        // ★ 你的决定（0.3.17）：用户断开后保持停机，绝不自动连回去。
+                        enterPaused("手机端主动断开");
+                    } else {
+                        scheduleReAdvertise(ReconnectBackoff.nextDelayMs(false, 0));
+                        scheduleAutoRefresh();
+                    }
+                    break;
+                }
+
+                case ST_PHONE_GO_HOME:
+                    log("手机回到桌面（画面保持最后一帧）");
+                    break;
+
+                case ST_PHONE_BACK_FOREGROUND:
+                    log("手机回到前台");
+                    break;
+
+                default:
+                    log("· 未处理的状态码 " + state + "（param=" + param + "），保持当前状态");
             }
-            final int st = newState;
+            final int st = state;
             main.post(() -> listener.onConnectionState(st));
         }
 
@@ -1737,6 +2152,23 @@ public class IccoaManager {
         public void onConnectingProgress(String phoneId, int progress) {
             log("onConnectingProgress " + progress);
             main.post(() -> listener.onProgress(progress));
+            if (progress > 0) {
+                // ★ 0.3.17（A3）：一旦开始握手，就进入「禁止重播」状态。
+                //   重播会换广播序列号（= 配对会话号），手机端会把这次握手当成另一个会话，
+                //   正在进行的鉴权被作废 —— 这是"手机提示连接失败"的典型成因。
+                if (!negotiating) {
+                    negotiating = true;
+                    armNegotiationRescue();
+                    main.removeCallbacks(autoRefreshRunnable);
+                }
+                if (paused) {
+                    log("■ 手机主动连入 → 自动退出停机态");
+                    paused = false;
+                    try { listener.onPaused(false); } catch (Throwable ignored) { }
+                }
+                main.removeCallbacks(castStopReconsiderRunnable);
+                if (connectRoundStartMs == 0L) startConnectRound("收到进度 " + progress);
+            }
             // 僵死防护撤销（0.3.8）：真实断联后 SDK 常在 2 秒内重启协商（progress 10 起步），
             // 只要协商还在推进就说明链路活着，撤掉待发的退出判定。
             if (linkLostArmed && progress > 0) {
@@ -2484,11 +2916,21 @@ public class IccoaManager {
         return id.length() <= 8 ? id : id.substring(0, 8);
     }
 
-    private static String stateName(int s) {        switch (s) {
-            case 0: return "DISCONNECTED";
-            case 1: return "CONNECTING";
-            case 2: return "CONNECTED";
-            case 3: return "ESTABLISHED";
+    /**
+     * SDK 状态码 → 可读名（0.3.17 修正）。
+     *
+     * <p>旧映射是自己猜的（1=CONNECTING / 2=CONNECTED / 3=ESTABLISHED / 0=DISCONNECTED），
+     * 与 SDK 的 {@code UCarConnectState} 对不上，日志因此一直在误导排查方向。
+     */
+    private static String stateName(int s) {
+        switch (s) {
+            case ST_DISCONNECTED: return "DISCONNECTED";
+            case ST_CONNECTED: return "CONNECTED";
+            case ST_CONNECT_FAILED: return "CONNECT_FAILED";
+            case ST_CAST_CONNECTED: return "CAST_CONNECTED";
+            case ST_CAST_DISCONNECTED: return "CAST_DISCONNECTED";
+            case ST_PHONE_GO_HOME: return "PHONE_GO_HOME";
+            case ST_PHONE_BACK_FOREGROUND: return "PHONE_BACK_FOREGROUND";
             default: return "STATE_" + s;
         }
     }

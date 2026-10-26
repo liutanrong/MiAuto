@@ -1030,4 +1030,8 @@
     <string name="setup_usb_priority">USB 优先</string>
     <string name="setup_usb_priority_toggle">插着数据线时只走线</string>
     <string name="setup_usb_priority_hint">默认开启。无线一旦完成握手，ICCOA SDK 会立刻停掉蓝牙广播，数据线就再没有参与机会。打开这一项后，插入 USB 配件会停掉广播，让手机只能走数据线。想让「谁先连上算谁」就关掉它。</string>
+    <string name="icoca_paused_hint">已断开 · 点「刷新配对码」重新连接</string>
+    <string name="icoca_advertise_retry">蓝牙广播重试中（第 %1$d 次）</string>
+    <string name="icoca_5g_only">优先 5GHz</string>
+    <string name="icoca_5g_only_desc">广播前把 Wi-Fi Direct 工作信道偏置到 5GHz；建组后会校验实际频率，落在 2.4G 只提示、不中断会话。</string>
 </resources>

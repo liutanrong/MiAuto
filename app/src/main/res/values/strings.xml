@@ -1083,4 +1083,8 @@
     <string name="setup_usb_priority">USB priority</string>
     <string name="setup_usb_priority_toggle">Use the cable when one is plugged in</string>
     <string name="setup_usb_priority_hint">On by default. Once a wireless link completes its handshake, the ICCOA SDK stops advertising — the cable then has no way in. With this on, connecting a USB accessory stops the Bluetooth advertisement so the phone can only use the cable. Turn it off if you prefer "whichever connects first".</string>
+    <string name="icoca_paused_hint">Disconnected · tap Refresh code to reconnect</string>
+    <string name="icoca_advertise_retry">Bluetooth broadcasting retry #%1$d</string>
+    <string name="icoca_5g_only">Prefer 5 GHz</string>
+    <string name="icoca_5g_only_desc">Bias the Wi-Fi Direct group to 5 GHz before advertising. After the group is up the actual frequency is verified; 2.4 GHz is only reported, never used to drop the session.</string>
 </resources>
