@@ -715,6 +715,7 @@ public class IccoaManager {
             stats.surfaceH = videoH;
         }
         log("[诊断汇总] " + reason + " | " + stats.summary());
+        stats.consumeHadFrame();
     }
 
     public void onSurfaceDestroyed() {

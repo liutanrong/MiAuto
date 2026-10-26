@@ -26,6 +26,15 @@ final class IccoaSessionStats {
     long lastFirstFrameMs = -1L;
     boolean firstFrameBeforeProgress100 = false;
 
+    /**
+     * 本次投屏页存活期间是否真的出过画面（0.3.15）。
+     *
+     * <p>只靠 {@code lastFirstFrameMs} 判断「结果=正常/黑屏」会误报：新会话的 progress 10
+     * 一到，清场逻辑就把首帧耗时抹掉，于是「看了半小时视频、关页时汇总写黑屏」——
+     * 10/25 报告里绝大多数「结果=黑屏」都是这么来的。
+     */
+    boolean hadFrame = false;
+
     /** 本会话里「≥2 指」的触摸事件数 / 最大手指数（0.3.15，用于验证双指缩放是否真的发出去了）。 */
     int multiTouchEvents = 0;
     int multiTouchMax = 0;
@@ -55,6 +64,7 @@ final class IccoaSessionStats {
     }
 
     void onFirstFrame() {
+        hadFrame = true;
         long now = System.currentTimeMillis();
         firstFrameAt = now;
         firstFrameBeforeProgress100 = (progress100At == 0L);
@@ -73,6 +83,11 @@ final class IccoaSessionStats {
         progress100At = 0L;
         firstFrameAt = 0L;
         lastFirstFrameMs = -1L;
+    }
+
+    /** 打完汇总就清掉「出过画」标记，下一次汇总重新计。 */
+    void consumeHadFrame() {
+        hadFrame = false;
     }
 
     /** 汇总一行，写进诊断报告。缺数据的项写 {@code ?}，不猜。 */
@@ -97,6 +112,8 @@ final class IccoaSessionStats {
         if (lastFirstFrameMs >= 0) {
             sb.append(" 首帧=").append(lastFirstFrameMs).append("ms")
                     .append(firstFrameBeforeProgress100 ? "(自startCast)" : "(自progress100)");
+        } else if (hadFrame) {
+            sb.append(" 首帧=已出画(计时被下一场清零)");
         } else {
             sb.append(" 首帧=未就绪");
         }
@@ -115,7 +132,7 @@ final class IccoaSessionStats {
         if (!phoneModel.isEmpty()) {
             sb.append(" 手机=").append(phoneModel);
         }
-        sb.append(" 结果=").append(lastFirstFrameMs >= 0 ? "正常" : "黑屏");
+        sb.append(" 结果=").append((lastFirstFrameMs >= 0 || hadFrame) ? "正常" : "黑屏");
         return sb.toString();
     }
 }
