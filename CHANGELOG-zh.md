@@ -1,3 +1,49 @@
+# MiAuto 0.3.19 — 2026-10-28
+
+**声音断续 + 连接 P0**
+
+这轮的起点是你给的三条对照：Wi-Fi 下声音断续、USB 不卡、降分辨率无效、单独音频也卡。
+音频码流约 200 kbps，比视频小 30 倍，它都在断，就不可能是带宽；USB 不卡又不可能是手机端
+或解码能力。剩下的只有介质本身 —— P2P 的空口调度。
+
+- **E1-1 WifiLock 改 LOW_LATENCY**：`HIGH_PERF` 只保证射频不全睡，不改变空口排队；
+  `WIFI_MODE_FULL_LOW_LATENCY`（API 29，本机 Android 10）才会禁用 PS 省电轮询 ——
+  它的代价正是 100ms 量级的周期性延迟尖峰，而 AudioTrack 的缓冲一被抽干就是声音断续 ——
+  同时把包放进 WMM 高优先级队列。定制机芯不认这个档位时自动退回 HIGH_PERF。
+- **E1-2 会话建立即释放 MulticastLock**：它只在"还没连上、靠组播找设备"时有用。一直持有会让
+  芯片每个 DTIM 都醒来收组播帧，白占空口 —— 而这段空口正是音频要抢的。
+- **E1-3 只声明 UNII-3**：实测组一直落在 5180MHz（ch36，UNII-1，低功率、通常 20MHz）。
+  白名单改为 149/153/157/161。个别只支持 UNII-1 的机型可用 `iccoa-5g-unii3-only=0` 关掉。
+- **E2-1/E2-2 别再自己拖自己**：流畅度采样用 PixelCopy 在 video SurfaceView 上 4 次/秒跑 30 秒，
+  等于在渲染关键路径上插 GPU 同步点 —— 用制造卡顿的工具去测卡顿。现在默认关闭
+  （`iccoa-smooth-probe`），首帧探测也从 250ms×60s 降到 500ms×15s。
+- **E3-3 应答音频焦点**：`onAudioFocusChanged` 一直是空实现且不打日志，
+  `UCarAudioManager.allowGainAudioFocus()` 从未被调用。现在记日志并无条件放行 ——
+  车机上没有别的应用在抢音频。
+
+连接：
+
+- **A1 `stopCast` 是 private**：0.3.18 用 `getMethod("stopCast")`，而它只搜 public 成员；
+  解 dex 得到的真身是 `direct PRIVATE V stopCast()`。所以 D2 一次都没跑起来。
+  现在改用 `getDeclaredMethod` + `setAccessible`，失败时会把方法名全表打出来，不用再猜。
+- **A2 USB 优先死循环**：`usbPriorityFallback` 的守卫用了 `castStarted`，而 AOA 分支只要
+  预热解码器就会把它置真 —— 10 秒回退永远不执行，12 秒看门狗于是反复断开：
+  10/27 那次 5 轮 / 4 分 37 秒，最后靠手动插拔线才活过来。守卫改为 `lastProgress > 0`。
+- **A8** 冷启动窗口 4000 → 2000ms。实测 6 次成功出画都在 43/423/430/433/454/455ms ——
+  窗口到期意味着"不会再来"，再等 4 秒只是让用户多盯 2 秒黑屏。
+- **A3–A7 诊断**：轮结果等 `connectType` 到达后再打（原来 10/12 次写"通道=未知"）；
+  `[通道]` 同一结论不重复刷（原来一场 4 条）；计划重播取最早到期（原来同一毫秒打
+  `+5000ms` 和 `+800ms` 两条）；`startCast` 时钟为 0 时打 `n/a`（原来打 20 天的鬼数字）；
+  停机态回执不再记成"异常断连"。
+- **E5 分辨率真正生效**：`buildConfig()` 每次重算画布，日志里补 `resolutionId`。
+  以前只在 Activity 启动时算一次 —— 这就是 10/28 报告里 12 场会话全是 1280x672 的原因。
+- **E3-1/E3-2 让取证不再骗人**：链路采样新增 `/proc/net/dev` 通道（本机 sysfs 对
+  untrusted_app 不可读，这就是 `[链路]` 从未出现过一次的原因），并输出丢包数与
+  RSSI/协商速率/频点。报告新增 AudioFlinger / AudioTrack / WifiP2p / wpa_supplicant 行，
+  以及最新一份崩溃文件的前 40 行。
+- **B1/B3** 每次重建都记 `VideoPlayerV2@hash` 实例指纹，用来验证"第二场能出画"到底是
+  「复用旧解码器」还是「换了新解码器」。
+
 # MiAuto 0.3.18 — 2026-10-26
 
 **D1/D2/D4/D5/D6/D8/D10/D11（D3、D7 本轮不做）**

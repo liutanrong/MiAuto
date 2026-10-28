@@ -42,6 +42,21 @@ class IcocaProjectionActivity : AppCompatActivity() {
     private var wifiLock: WifiManager.WifiLock? = null
     private var multicastLock: WifiManager.MulticastLock? = null
 
+    /**
+     * 流畅度采样开关（0.3.19 E2-1，默认关）。
+     *
+     * <p>采样本身用 PixelCopy 回读 video surface，会和被测对象抢 GPU 同步点，
+     * 开着它测「卡不卡」等于自带干扰源。只在专门排查时打开。
+     */
+    private val smoothProbeEnabled: Boolean by lazy {
+        try {
+            getSharedPreferences("icoca-prefs", Context.MODE_PRIVATE)
+                .getBoolean("icoca-smooth-probe", false)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // ★ 必须锁横屏。SDK 是按 landscape 画布协商的（setScreenSize 传的就是
@@ -140,11 +155,21 @@ class IcocaProjectionActivity : AppCompatActivity() {
 
                     if (state.castReady) {
                         stopPixelProbe()
+                        // ★ 0.3.19（E1-2）：会话建起来了，MulticastLock 就该还回去。
+                        //   它只在「还没连上、靠 mDNS/组播找设备」的阶段有用；P2P 建链之后
+                        //   组播收包纯属负担 —— 芯片每个 DTIM 都要醒来收组播帧，白耗空口和电，
+                        //   而这段空口时间正是音频包要抢的。
+                        releaseMulticastLock()
                         // 首帧之后跑一次流畅度采样（每个会话一次），给「卡不卡」一个客观数。
+                        // ★ 0.3.19（E2-1）：默认关闭。PixelCopy 在 video surface 上会强制
+                        //   GPU 同步回读，本身就会制造卡顿 —— 用一个「制造卡顿的工具」去测卡顿，
+                        //   结论必然失真。需要时在设置里开（icoca-smooth-probe）。
                         if (!smoothStarted) {
                             smoothStarted = true
-                            val sv = findViewById<SurfaceView>(R.id.icoca_surface)
-                            if (sv != null) startSmoothnessProbe(sv)
+                            if (smoothProbeEnabled) {
+                                val sv = findViewById<SurfaceView>(R.id.icoca_surface)
+                                if (sv != null) startSmoothnessProbe(sv)
+                            }
                         }
                         // 首帧确认后把当前日夜模式同步给手机（只同步一次，避免每帧都发）。
                         if (!dayNightSynced) {
@@ -510,14 +535,43 @@ class IcocaProjectionActivity : AppCompatActivity() {
     private fun acquireWifiLocks() {
         val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
         if (wifiLock == null) {
+            // ★ 0.3.19（E1-1）：HIGH_PERF → LOW_LATENCY。
+            //
+            //   WIFI_MODE_FULL_HIGH_PERF 只保证「射频不全睡」，不改变空口排队策略；
+            //   而音频断续（underrun）要的是**延迟上限**，不是「别睡」。
+            //
+            //   WIFI_MODE_FULL_LOW_LATENCY 是 Android 10 专为音视频引入的档位：
+            //   它会禁用 PS 省电轮询（省电轮询的代价恰好是 100ms 量级的周期性延迟尖峰，
+            //   而 ICCOA 的音频是和视频共用同一条 P2P 链路的 UDP 流，任何一次尖峰都会让
+            //   AudioTrack 的缓冲见底 → 声音断续），并把包放进 WMM 高优先级队列。
+            //
+            //   本机是 Android 10（API 29），正好是这条 API 的起点。
+            val mode = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                @Suppress("DEPRECATION")
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            }
+            val modeName = if (mode == WifiManager.WIFI_MODE_FULL_LOW_LATENCY) "LOW_LATENCY" else "HIGH_PERF"
             try {
-                wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "icoca:cast").apply {
+                wifiLock = wm.createWifiLock(mode, "icoca:cast").apply {
                     setReferenceCounted(false)
                     acquire()
                 }
-                AppLog.i("ICCOA: WifiLock(HIGH_PERF) 已获取")
+                AppLog.i("ICCOA: WifiLock($modeName) 已获取")
             } catch (t: Throwable) {
-                AppLog.i("ICCOA: WifiLock 获取失败 $t")
+                AppLog.i("ICCOA: WifiLock($modeName) 获取失败，退回 HIGH_PERF: $t")
+                // LOW_LATENCY 在少数定制机芯上不认（createWifiLock 会抛 IllegalArgumentException），
+                // 退回上一档，行为不比 0.3.18 差。
+                try {
+                    wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "icoca:cast").apply {
+                        setReferenceCounted(false)
+                        acquire()
+                    }
+                    AppLog.i("ICCOA: WifiLock(HIGH_PERF) 已获取（退回档）")
+                } catch (t2: Throwable) {
+                    AppLog.i("ICCOA: WifiLock 获取失败 $t2")
+                }
             }
         }
         if (multicastLock == null) {
@@ -537,6 +591,23 @@ class IcocaProjectionActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * 只释放组播锁，保留性能锁（0.3.19 E1-2）。
+     *
+     * <p>会话建起来之后组播没有用处，但射频性能锁必须一直持有到退屏。
+     */
+    private fun releaseMulticastLock() {
+        val l = multicastLock ?: return
+        try {
+            if (l.isHeld) {
+                l.release()
+                AppLog.i("ICCOA: MulticastLock 已释放（会话已建立，组播让出空口）")
+            }
+        } catch (_: Throwable) {
+        }
+        multicastLock = null
     }
 
     private fun releaseWifiLocks() {
@@ -569,13 +640,23 @@ class IcocaProjectionActivity : AppCompatActivity() {
     }
 
     companion object {
-        /** 像素采样周期。250ms 足够快，又不会干扰渲染线程。 */
-        private const val PROBE_INTERVAL_MS = 250L
+        /**
+         * 像素采样周期（0.3.19 E2-2：250 → 500ms）。
+         *
+         * <p>PixelCopy 不是免费的：它要把 video surface 的 buffer 从 SurfaceFlinger
+         * 读回 CPU，在 video surface 上会插一个 GPU 同步点。实测 4 次/秒时，
+         * 每次采样都落在渲染关键路径上。首帧判定不需要这么密的节奏 ——
+         * 真正的出画时间在 43~455ms 之间，500ms 一拍完全够用。
+         */
+        private const val PROBE_INTERVAL_MS = 500L
         /**
          * 采样时间窗。每次收到「连接进度变化」都会重新计时，所以它实际表示
          * 「最后一次进度变化之后还愿意等多久」。
+         *
+         * <p>0.3.19 E2-2：60s → 15s。首帧要么在 500ms 内到，要么就是死了；
+         * 原先挂 60 秒只在失败会话里白白多采 200 多次。
          */
-        private const val PROBE_WINDOW_MS = 60_000L
+        private const val PROBE_WINDOW_MS = 15_000L
 
         /** Read by MainActivity to avoid stacking a second projection instance. */
         @Volatile

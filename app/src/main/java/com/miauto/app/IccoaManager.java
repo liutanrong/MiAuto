@@ -378,7 +378,15 @@ public class IccoaManager {
             if (!usbPriority || adapter == null) {
                 return;
             }
-            if (sessionActive || castStarted) {
+            // ★ 0.3.19（A2）：守卫从 castStarted 改成 lastProgress。
+            //
+            //   castStarted 只表示「我们调过 startCast」，预热也会把它置真；用它当守卫，
+            //   10 秒回退就永远不执行 —— 10/27 18:12 的 USB 死循环正是这么来的：
+            //     doAdvertise() → AOA 分支 → tryStartCast() → castStarted=true
+            //     → 本 Runnable 被自己的守卫挡掉 → 永不广播 → 手机永远发现不了车机
+            //     → 12s 起投看门狗断开 → 回到 doAdvertise() …… 循环 5 次、4 分 37 秒
+            //   真正该看的是「手机有没有开始握手」：握手了 progress 就会 > 0。
+            if (sessionActive || lastProgress > 0) {
                 return;
             }
             log("USB 优先：10 秒内没有 AOA 建链 → 回退到蓝牙广播（手机可能不走数据线）");
@@ -511,6 +519,7 @@ public class IccoaManager {
      * 「断开后自动刷新链接码」。
      */
     private final Runnable reAdvertiseRunnable = () -> {
+        reAdvertiseDueAt = 0L;
         if (sdkReady && adapter != null) {
             log("会话结束 → 重新广播（等待手机再次连接，届时下发新的配对码）");
             reAdvertise();
@@ -530,11 +539,33 @@ public class IccoaManager {
      * 但「首屏看门狗」这条路不一样——那条会话从头到尾没出过一帧，手机端也停在它自己的
      * 启动页，没有稳定的数据面要拆，等 5 秒纯属浪费。日志实测：重播之后 2.2 秒手机就回来了，
      * 所以这条分支只等 2 秒。
+     *
+     * <p>★ 0.3.19（A5）：取「最早到期」，不再无脑覆盖。
+     * 原先 disconnectSession() 先排 5000ms、看门狗紧接着排 800ms，日志里就是
+     * 「计划重播：+5000ms / 计划重播：+800ms」两条挨着打 —— 看着像两个任务，
+     * 实际是靠 removeCallbacks 把 5 秒那条顶掉。一旦调用顺序反过来（先 800 再 5000），
+     * 短延时就被吃掉了，本该 0.8 秒重连的会话要干等 5 秒。
      */
     private void scheduleReAdvertise(long delayMs) {
-        main.removeCallbacks(reAdvertiseRunnable);
+        final long due = System.currentTimeMillis() + delayMs;
+        if (reAdvertiseDueAt > 0L && reAdvertiseDueAt <= due) {
+            log("计划重播：+" + delayMs + "ms（已有更早的 +"
+                    + Math.max(0L, reAdvertiseDueAt - System.currentTimeMillis()) + "ms，保留前者）");
+            return;
+        }
+        cancelReAdvertise();
         main.postDelayed(reAdvertiseRunnable, delayMs);
+        reAdvertiseDueAt = due;
         log("计划重播：+" + delayMs + "ms");
+    }
+
+    /** 计划中的重播到期时间（0 表示没有排程）。A5 用它做「取最早」比较。 */
+    private volatile long reAdvertiseDueAt = 0L;
+
+    /** 取消已排程的重播，并把 A5 的到期时间一并清掉（否则会被误判成「已有更早排程」）。 */
+    private void cancelReAdvertise() {
+        main.removeCallbacks(reAdvertiseRunnable);
+        reAdvertiseDueAt = 0L;
     }
 
     /**
@@ -654,14 +685,25 @@ public class IccoaManager {
     public void setScreenSize(int w, int h) {
         screenW = Math.max(1, w);
         screenH = Math.max(1, h);
+        recomputeVideoSize();
+    }
+
+    /**
+     * 按「面板尺寸 + 设置里的视频分辨率」重算投屏画布（0.3.19 E5）。
+     *
+     * <p>原先这段只在 {@link #setScreenSize} 里跑，而 setScreenSize 只有 MainActivity
+     * 启动时调一次 —— 用户在设置里改了分辨率、点「保存并重启」之外的任何操作都不会生效。
+     * 10/28 报告里 12 场会话的「投屏尺寸」全部是 1280x672，一帧没变过，就是这么来的。
+     * 现在 {@code buildConfig()} 每次都会调用本方法，改完设置下一次连接即生效。
+     */
+    private void recomputeVideoSize() {
         // ★ 投屏画布上限跟随「视频分辨率」设置项（Settings.resolutionId）。
-        //   默认 720p：1920x990@30 约 190 万像素/帧，H.264 码率 8~12 Mbps，而车机走的是
-        //   SoftAP（2.4GHz，实际吞吐 20~30 Mbps 且抖动大），余量撑不住稳定 30fps。
-        //   降到 720p 级（约 85 万像素）码率减半。想更清晰就去设置里切 1080p，想更流畅切 480p，
-        //   不需要重新编译。
+        //   默认 720p：1920x990@30 约 190 万像素/帧，H.264 码率 8~12 Mbps，余量不足。
+        //   降到 480p（约 43 万像素）码率可再降一档，用于排查「是不是带宽/解码撑不住」。
         int capW = 1280, capH = 720;
+        int rid = -1;
         try {
-            int rid = new com.andrerinas.openheadunit.utils.Settings(appCtx).getResolutionId();
+            rid = new com.andrerinas.openheadunit.utils.Settings(appCtx).getResolutionId();
             switch (rid) {
                 case 1: capW = 800;  capH = 480;  break;   // 480p
                 case 3: capW = 1920; capH = 1080; break;   // 1080p
@@ -681,7 +723,7 @@ public class IccoaManager {
         videoW = Math.min(capW, ((videoW + 15) / 16) * 16);
         videoH = Math.min(capH, ((videoH + 15) / 16) * 16);
         log("投屏尺寸: 面板 " + screenW + "x" + screenH + " → 视频 " + videoW + "x" + videoH
-                + "（上限 " + capW + "x" + capH + "，已按 16 对齐）");
+                + "（上限 " + capW + "x" + capH + "，resolutionId=" + rid + "，已按 16 对齐）");
     }
 
     public String getLastPinCode() { return lastPinCode; }
@@ -922,6 +964,10 @@ public class IccoaManager {
 
     /** 当前通道的可读描述（投屏页角标 / 首页状态用）。 */
     private volatile String transportLabel = null;
+    /** 上一行「依据」文案，用于 A4 去重。 */
+    private volatile String transportEvidence = null;
+    /** 本场会话是否已经判定过通道（ct=-1 时用来区分「还没判」和「判不了」）。 */
+    private volatile boolean transportResolved = false;
 
     public String getTransportLabel() { return transportLabel; }
 
@@ -952,6 +998,15 @@ public class IccoaManager {
         }
         if (ct == 3) {
             setTransport("SoftAP Wi-Fi", "connectType=3");
+            return;
+        }
+
+        // ★ 0.3.19（A4）：ct=-1 且没有 AOA 证据 → 这一场还没拿到类型，先不下结论。
+        //
+        //   10/28 报告里每场会话都会先打一条「connectType=-1 / 频段=5180MHz」，
+        //   20~40ms 后又打一条「connectType=1 / 频段=5180MHz」——前者是猜测，后者才是事实。
+        //   等 state=2 把类型带回来再判，角标才不会先闪一下错的依据。
+        if (ct == -1 && !transportResolved) {
             return;
         }
 
@@ -994,10 +1049,18 @@ public class IccoaManager {
         setTransport("P2P Wi-Fi（频段未知）", "connectType=" + ct);
     }
 
-    /** 统一出口：写标签 + 打一行「依据」（D8：同一会话不重复刷）。 */
+    /** 统一出口：写标签 + 打一行「依据」（A4：同一会话同一结论不重复刷）。 */
     private void setTransport(String label, String evidence) {
+        final boolean labelChanged = !label.equals(transportLabel);
+        final boolean evidenceChanged = evidence == null || !evidence.equals(transportEvidence);
         transportLabel = label;
-        log("[通道] 当前数据通道：" + label + "（依据：" + evidence + "）");
+        transportEvidence = evidence;
+        transportResolved = true;
+        // 0.3.18 的注释写着「D8 同一会话不重复刷」，但代码里没有任何判断，
+        // 于是一场会话打 4 条一模一样的「[通道] 当前数据通道」—— 日志预算全被它吃了。
+        if (labelChanged || evidenceChanged) {
+            log("[通道] 当前数据通道：" + label + "（依据：" + evidence + "）");
+        }
         try { listener.onTransportLabel(label); } catch (Throwable ignored) { }
     }
 
@@ -1133,7 +1196,7 @@ public class IccoaManager {
             castStarted = false;
             sessionActive = false;
             main.removeCallbacks(autoRefreshRunnable);
-            main.removeCallbacks(reAdvertiseRunnable);
+            cancelReAdvertise();
         }
 
         UCarConfig config;
@@ -1267,7 +1330,7 @@ public class IccoaManager {
                 adapter.unregisterPhoneDataListener(phoneDataListener);
             } catch (Throwable ignored) { }
         }
-        main.removeCallbacks(reAdvertiseRunnable);
+        cancelReAdvertise();
         main.removeCallbacks(usbPriorityFallback);
         cancelAutoRefresh();
         cancelNegotiationRescue();
@@ -1330,7 +1393,7 @@ public class IccoaManager {
         sessionActive = false;
         negotiating = false;
         lastPinCode = null;
-        main.removeCallbacks(reAdvertiseRunnable);
+        cancelReAdvertise();
         main.removeCallbacks(autoRefreshRunnable);
         main.removeCallbacks(usbPriorityFallback);
         try {
@@ -1369,7 +1432,29 @@ public class IccoaManager {
     private void logConnectRoundResult(String result) {
         // state=4（投屏已连）与 state=2（已连）会前后脚各来一次，只记第一条（D8）。
         if (roundResultLogged) return;
-        if ("成功".equals(result)) roundResultLogged = true;
+        if (!"成功".equals(result)) {
+            logRoundLine(result);
+            return;
+        }
+        roundResultLogged = true;
+        // ★ 0.3.19（A3）：成功后延后 600ms 再打这一行。
+        //
+        //   10/28 报告里 12 条「第 N 轮结果」有 10 条写「通道=未知」——
+        //   因为 state=4(CAST_CONNECTED) 到达时 connectType 还没写进 stats，
+        //   要等 20~40ms 后那条 state=2(CONNECTED) 才带上类型。
+        //   延后一拍，通道就能写对；轮次与起点都取快照，避免和下一轮串号。
+        final int round = connectRound;
+        final long startMs = connectRoundStartMs;
+        final int stage = lastProgress;
+        main.postDelayed(() -> {
+            long ms = startMs == 0L ? -1L : System.currentTimeMillis() - startMs;
+            log("[连接] 第 " + round + " 轮结果=" + result + " 通道=" + channelShort()
+                    + (ms >= 0 ? " 用时=" + ms + "ms" : "") + " 阶段=" + stage + "%");
+        }, 600L);
+    }
+
+    /** 立即打一行轮结果（失败/断开等不需要等 connectType 的场合）。 */
+    private void logRoundLine(String result) {
         long ms = connectRoundStartMs == 0L ? -1L : System.currentTimeMillis() - connectRoundStartMs;
         log("[连接] 第 " + connectRound + " 轮结果=" + result + " 通道=" + channelShort()
                 + (ms >= 0 ? " 用时=" + ms + "ms" : "") + " 阶段=" + lastProgress + "%");
@@ -1849,8 +1934,13 @@ public class IccoaManager {
      * startCast 后 ~2.55s 才完成 —— 2.5s 窗口在管线就绪前 50ms 就到期，
      * 第一场被冤杀一次。参照第二场模式（onWfdSinkReady → ~200ms 出首帧），
      * 4s 给足「init → 首帧」余量；最坏情况多等 1.5s 才走重绑→断开老链兜底。
+     *
+     * <p>★ 0.3.19（A8）：4000 → 2000ms。
+     * 10/28 报告里 6 次成功出画全部落在 <b>43 / 423 / 430 / 433 / 454 / 455 ms</b>，
+     * 没有一次超过 0.5 秒。也就是说这个窗口一旦到期，画面就<b>不会再来</b>了，
+     * 继续等 4 秒纯属让用户多盯 2 秒黑屏。缩到 2 秒仍有 4 倍余量。
      */
-    private static final long COLD_START_TIMEOUT_MS = 4000L;
+    private static final long COLD_START_TIMEOUT_MS = 2000L;
 
     /**
      * USB 链路的冷启动等待。
@@ -1900,15 +1990,104 @@ public class IccoaManager {
                 log("[重建] 反射拿不到 CastManager，回退重绑");
                 return false;
             }
-            java.lang.reflect.Method stop = cm.getClass().getMethod("stopCast");
+            // ★ 0.3.19（A1）：getMethod → getDeclaredMethod。
+            //
+            //   0.3.18 用 getMethod("stopCast") 一直抛 NoSuchMethodException，
+            //   日志里写着 "CastManager.stopCast []" —— 类名对得上、零参也对得上，
+            //   唯一可能是**可见性**。解 classes3.dex 的 class_data 后确认：
+            //     direct PRIVATE V stopCast()   access=0x20002
+            //   而 pauseCast / release / stopWfdServer 都是 public virtual。
+            //   Class.getMethod() 只搜 public，private 必须 getDeclaredMethod。
+            java.lang.reflect.Method stop;
+            try {
+                stop = cm.getClass().getDeclaredMethod("stopCast");
+            } catch (NoSuchMethodException nsme) {
+                // 自证：把这个类真实存在的方法名列出来，下次不用再猜。
+                StringBuilder sb = new StringBuilder();
+                for (java.lang.reflect.Method m : cm.getClass().getDeclaredMethods()) {
+                    if (sb.length() > 0) sb.append(", ");
+                    sb.append(m.getName()).append('/').append(m.getParameterCount());
+                }
+                log("[重建] CastManager 无 stopCast，实际方法: " + sb);
+                return false;
+            }
+            stop.setAccessible(true);
+
+            // ★ 0.3.19（B1）：记解码器实例指纹。
+            //   要验证的假设是「进程内第一个 VideoPlayerV2 必黑、复用的就能出画」——
+            //   只有把每次 release/新建后的 identityHashCode 记下来，下一轮日志才能证伪。
+            final String before = videoPlayerId(cm);
             stop.invoke(cm);
-            log("[重建] 已释放 VideoPlayerV2（stopCast，不动会话）→ 立即重建并重投");
             castStarted = false;
             tryStartCast();
+            log("[重建] 已释放 VideoPlayerV2(" + before + "，stopCast，不动会话）→ 立即重建并重投");
+            // startCast 是 post 到 SDK worker 的，立刻读 mVideoPlayer 还是 null。
+            // 延后一拍再读，才能看到「重建出来的到底是不是新对象」（B1）。
+            final Object cmRef = cm;
+            main.postDelayed(() -> log("[重建] 重建后 VideoPlayerV2=" + videoPlayerId(cmRef)), 800L);
             return true;
         } catch (Throwable t) {
             log("[重建] stopCast 反射不可用: " + t);
             return false;
+        }
+    }
+
+    /** 读 CastManager.mVideoPlayer 的实例指纹（B1）。拿不到就打 n/a，不抛。 */
+    private String videoPlayerId(Object castManager) {
+        try {
+            java.lang.reflect.Field fp = castManager.getClass().getDeclaredField("mVideoPlayer");
+            fp.setAccessible(true);
+            Object vp = fp.get(castManager);
+            return vp == null ? "null" : (vp.getClass().getSimpleName()
+                    + "@" + Integer.toHexString(System.identityHashCode(vp)));
+        } catch (Throwable t) {
+            return "n/a";
+        }
+    }
+
+    /**
+     * 让 SDK 拿到音频焦点（0.3.19 E3-3）。
+     *
+     * <p>反编译确认的反射路径（两处持有同一个实例，任取其一）：
+     * <pre>
+     *   UCarAdapter.mUCarAudioManager            : UCarAudioManager
+     *   UCarAdapter.mCastManager.mUCarAudioManager : UCarAudioManager
+     *   UCarAudioManager.allowGainAudioFocus()     : public void
+     * </pre>
+     */
+    private void allowGainAudioFocusForSdk() {
+        if (adapter == null) return;
+        Object am = null;
+        try {
+            java.lang.reflect.Field fa = adapter.getClass().getDeclaredField("mUCarAudioManager");
+            fa.setAccessible(true);
+            am = fa.get(adapter);
+        } catch (Throwable ignored) {
+            // 退到 CastManager 里的那一份
+        }
+        if (am == null) {
+            try {
+                java.lang.reflect.Field fc = adapter.getClass().getDeclaredField("mCastManager");
+                fc.setAccessible(true);
+                Object cm = fc.get(adapter);
+                if (cm != null) {
+                    java.lang.reflect.Field fa2 = cm.getClass().getDeclaredField("mUCarAudioManager");
+                    fa2.setAccessible(true);
+                    am = fa2.get(cm);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        if (am == null) {
+            log("[音频] 反射拿不到 UCarAudioManager，本次无法放行焦点");
+            return;
+        }
+        try {
+            java.lang.reflect.Method m = am.getClass().getMethod("allowGainAudioFocus");
+            m.invoke(am);
+            log("[音频] allowGainAudioFocus() 已调用");
+        } catch (Throwable t) {
+            log("[音频] allowGainAudioFocus 失败: " + t);
         }
     }
 
@@ -2188,7 +2367,7 @@ public class IccoaManager {
                 case ST_CONNECTED:
                 case ST_CAST_CONNECTED: {
                     // 真连上：撤销所有待执行的重播/超时，握手结束，退避复位。
-                    main.removeCallbacks(reAdvertiseRunnable);
+                    cancelReAdvertise();
                     main.removeCallbacks(castStopReconsiderRunnable);
                     cancelConnectingTimeout();
                     cancelNegotiationRescue();
@@ -2255,15 +2434,26 @@ public class IccoaManager {
                     final boolean selfInitiated =
                             (System.currentTimeMillis() - selfDisconnectAt) < 3000L;
                     boolean byUser = (param == DISCONNECT_BY_USER) && !selfInitiated;
+                    // ★ 0.3.19（A7）：停机中收到的这条回执，来源其实是「刚刚那次
+                    //   userDisconnect() 的 disconnect()」，不是异常断连。
+                    //   旧写法因为 selfInitiated 把 byUser 压成 false，于是打
+                    //   「会话清理（异常断连）」+ 轮结果「异常断连」—— 用户手点的断开
+                    //   在日志里变成了故障，复盘时会被误判。
+                    final boolean stoppedByUs = paused;
                     log("会话断开（param=" + param + "，"
                             + (selfInitiated ? "本端断开回执" : byUser ? "用户/手机主动断开" : "异常断连") + "）");
                     // 先判僵死（要用 castStarted/everSurfaceReady），再清状态
                     armLinkLostIfNeeded(state);
-                    endSession(byUser ? "用户主动断开" : "异常断连");
-                    logConnectRoundResult(byUser ? "用户断开" : "异常断连");
-                    if (byUser || paused) {
+                    if (stoppedByUs || byUser) {
+                        endSession(stoppedByUs ? "停机中回执" : "用户主动断开");
+                        logConnectRoundResult("用户断开");
+                    } else {
+                        endSession(selfInitiated ? "本端断开回执" : "异常断连");
+                        logConnectRoundResult("异常断连");
+                    }
+                    if (byUser || stoppedByUs) {
                         // ★ 你的决定（0.3.17）：用户断开后保持停机，绝不自动连回去。
-                        enterPaused("手机端主动断开");
+                        enterPaused(stoppedByUs ? "已停机（回执）" : "手机端主动断开");
                     } else if (selfInitiated) {
                         // 本端断开：调用方（看门狗/重播链）已经排好重播，这里不再叠加。
                         log("· 本端断开的回执，按已排程的重播继续");
@@ -2338,6 +2528,8 @@ public class IccoaManager {
                 // D5：通道类型也必须按场重置，否则 dev=-1 的会话会沿用上一场的 P2P。
                 stats.connectType = -1;
                 fiveGLogged = false;
+                // A4：本场还没判过通道 —— 允许 ct=-1 时先按兵不动，等 state=2 带回类型。
+                transportResolved = false;
                 surfaceReady = false;   // 否则上一轮成功会污染这一轮的「结果=正常/黑屏」
                 castRetry = 0;
                 connectTypeLogged = false;
@@ -2387,7 +2579,11 @@ public class IccoaManager {
                 stats.onProgress(progress);
                 lastSegMs = (tProgress90 > 0L) ? (now - tProgress90) : -1L;
                 log("[诊断] 协商末段 90→100 = " + lastSegMs + "ms"
-                        + "（startCast 至今 " + (now - tStartCast) + "ms）");
+                        // ★ 0.3.19（A6）：startCast 可能晚于 progress 100（投屏页还没起来），
+                        //   此时 tStartCast 仍是 0 —— 直接相减会打出「1793145052541ms」这种
+                        //   20 天的鬼数字，把整份报告的可信度拉低。
+                        + "（startCast 至今 "
+                        + (tStartCast == 0L ? "n/a（尚未起投）" : (now - tStartCast) + "ms") + "）");
                 logConnectType(phoneId);
                 scheduleSurfaceWatchdog();
             }
@@ -2463,7 +2659,23 @@ public class IccoaManager {
             main.post(() -> listener.onCallState(text));
         }
         @Override public void onPOIReceived(String phoneId, UCarCommon.POIAddress poi) { }
-        @Override public void onAudioFocusChanged(UCarCommon.AudioType type, int focus) { }
+
+        /**
+         * 音频焦点（0.3.19 E3-3）。
+         *
+         * <p>0.3.18 及以前这是<b>空实现</b>，而且一行日志都没有 —— 完全不知道 SDK 有没有
+         * 在等我们回应。ICCOA 的音频是 UCarAudioManager 从网络收包后直接写 AudioTrack，
+         * 如果 SDK 在起播前先要一次焦点授权（{@code allowGainAudioFocus()}，
+         * 反编译确认它是 public），而我们永不回应，SDK 只能走超时降级路径。
+         *
+         * <p>车机上不存在与它竞争的音频应用，所以这里无条件放行 —— 放行不会比现在更糟，
+         * 但会消掉「等超时」这段不确定延迟。
+         */
+        @Override
+        public void onAudioFocusChanged(UCarCommon.AudioType type, int focus) {
+            log("[音频] 焦点回调 type=" + type + " focus=" + focus + " → 放行");
+            main.post(IccoaManager.this::allowGainAudioFocusForSdk);
+        }
 
         @Override
         @SuppressWarnings("rawtypes")
@@ -2502,6 +2714,9 @@ public class IccoaManager {
         int fps = clamp(readIntSetting(IccoaPrefs.KEY_FPS_LIMIT, 60), 15, 60);
         appliedFps = fps;
         int sw = Math.max(1, screenW), sh = Math.max(1, screenH);
+        // ★ 0.3.19（E5）：每次建配置都重算一次画布 —— 设置里改完分辨率不用重启 App，
+        //   下一次连接就用新尺寸协商。以前只有 MainActivity 启动时算过一次。
+        recomputeVideoSize();
         int vw = Math.max(1, videoW), vh = Math.max(1, videoH);
 
         UCarCommon.WorkMode workMode = new UCarCommon.WorkMode.Builder()
@@ -2550,8 +2765,17 @@ public class IccoaManager {
         //   界面上连六位配对码都不会出现。
         //   车机上 transport=0（P2P）所以一直没暴露；换成 Hotspot 的假车机立刻必现。
         if (useP2p) {
-            //   UNII-1(36-48) + UNII-3(149-161)，全部避开 DFS（雷达检测会瞬断）。
-            b.setAllowed5gChannels(new int[]{36, 40, 44, 48, 149, 153, 157, 161});
+            //   0.3.19（E1-3）：默认只声明 UNII-3（149~161）。
+            //
+            //   10/28 报告实测落在 5180MHz = ch36（UNII-1）。UNII-1 在多数地区的
+            //   发射功率上限比 UNII-3 低 6~10dB，且常被限在 20MHz —— 空口余量和
+            //   抗干扰都差一档。而「声音断续」正是空口延迟尖峰的表现。
+            //   把 36~48 从白名单里去掉，逼手机在 UNII-3 上建组。
+            //   个别只支持 UNII-1 的机型可以关掉这个开关（iccoa-5g-unii3-only=0）。
+            final boolean unii3Only = IccoaPrefs.getBool(appCtx, "iccoa-5g-unii3-only", true);
+            b.setAllowed5gChannels(unii3Only
+                    ? new int[]{149, 153, 157, 161}
+                    : new int[]{36, 40, 44, 48, 149, 153, 157, 161});
         }
 
         b.setSupportCamera(false);
@@ -2944,51 +3168,126 @@ public class IccoaManager {
      */
     private static final long LINK_STATS_INTERVAL_MS = 5_000L;
 
-    private long linkRxPrev = -1L, linkTxPrev = -1L, linkTsPrev = 0L;
+    private long linkRxPrev = -1L, linkTxPrev = -1L, linkDropPrev = -1L, linkTsPrev = 0L;
     private int linkTick = 0;
+    private boolean linkStatsWarned = false;
 
     private final Runnable linkStatsTick = new Runnable() {
         @Override
         public void run() {
             if (!castStarted) return;
             long now = System.currentTimeMillis();
-            long rx = readNetStat("rx_bytes");
-            long tx = readNetStat("tx_bytes");
-            if (rx >= 0 && tx >= 0 && linkRxPrev >= 0 && linkTsPrev > 0) {
+            long[] rx = readIfaceStat("rx_bytes");
+            long[] tx = readIfaceStat("tx_bytes");
+            long[] drop = readIfaceStat("rx_dropped");
+            if (rx == null || tx == null) {
+                // ★ 0.3.19（E3-1）：0.3.16 起这条采样一直静默失败 ——
+                //   /sys/class/net/p2p0/statistics/* 对普通 App 不可读，readNetStat 返回 -1，
+                //   外层 if 不成立就跳过，**一行日志都不留**。10/28 报告 1227 行里
+                //   「[链路]」出现 0 次，就是这个原因。
+                //   现在读不到就明说一次，别再让「没数据」冒充「没异常」。
+                if (!linkStatsWarned) {
+                    linkStatsWarned = true;
+                    log("[链路] 采样不可用：/sys 与 /proc/net/dev 都读不到 p2p0 —— 速率/丢包本场缺席");
+                }
+            } else if (linkRxPrev >= 0 && linkTsPrev > 0) {
                 double sec = (now - linkTsPrev) / 1000.0;
                 if (sec > 0.5) {
-                    double rxMbps = (rx - linkRxPrev) * 8 / sec / 1_000_000.0;
-                    double txMbps = (tx - linkTxPrev) * 8 / sec / 1_000_000.0;
+                    double rxMbps = (rx[0] - linkRxPrev) * 8 / sec / 1_000_000.0;
+                    double txMbps = (tx[0] - linkTxPrev) * 8 / sec / 1_000_000.0;
+                    long dDrop = (drop != null && linkDropPrev >= 0) ? (drop[0] - linkDropPrev) : 0L;
                     // 每 10 秒记一行，避免把日志刷成流量计
                     if ((linkTick++ & 1) == 0) {
                         log(String.format(java.util.Locale.US,
-                                "[链路] p2p0 收 %.1f Mbps / 发 %.1f Mbps", rxMbps, txMbps));
+                                "[链路] %s 收 %.1f Mbps / 发 %.1f Mbps / 新增丢包 %d%s",
+                                rx[1] == 0L ? "p2p0" : "wlan0", rxMbps, txMbps, dDrop, wifiRadio()));
                     }
                 }
             }
-            linkRxPrev = rx;
-            linkTxPrev = tx;
+            if (rx != null) linkRxPrev = rx[0];
+            if (tx != null) linkTxPrev = tx[0];
+            if (drop != null) linkDropPrev = drop[0];
             linkTsPrev = now;
             main.postDelayed(this, LINK_STATS_INTERVAL_MS);
         }
     };
 
-    /** 优先读 p2p0（无线直连），拿不到再退回 wlan0；两者都不可读时返回 -1。 */
-    private long readNetStat(String name) {
-        for (String iface : new String[]{"p2p0", "wlan0"}) {
+    /**
+     * 射频侧的三个数（0.3.19 E3-4）：协商速率 / 信号 / 频点。
+     *
+     * <p>「声音断续」如果伴随 RSSI &lt; -70dBm 或协商速率掉到 20~40Mbps，
+     * 那就是空口余量不足；如果三者都健康却仍在断续，问题就在协议栈或调度，
+     * 和射频无关 —— 这条区分决定了下一步要不要换信道/换模式。
+     *
+     * <p>注意：{@code getConnectionInfo()} 报的是 STA 侧（wlan0）的连接，
+     * P2P 走的是 p2p0，未必能读到。读不到就打 n/a，不猜。
+     */
+    private String wifiRadio() {
+        try {
+            android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager)
+                    appCtx.getSystemService(Context.WIFI_SERVICE);
+            if (wm == null) return " / 射频 n/a";
+            android.net.wifi.WifiInfo wi = wm.getConnectionInfo();
+            if (wi == null) return " / 射频 n/a";
+            int rssi = wi.getRssi();
+            int speed = wi.getLinkSpeed();
+            int freq = wi.getFrequency();
+            if (rssi == -127 && speed <= 0 && freq <= 0) return " / 射频 n/a";
+            return " / 射频 " + rssi + "dBm " + speed + "Mbps " + freq + "MHz";
+        } catch (Throwable t) {
+            return " / 射频 n/a";
+        }
+    }
+
+    /**
+     * 读某个接口的计数器（0.3.19 E3-1 重写）。
+     *
+     * <p>返回 {@code {值, 来源}}，来源 0=sysfs / 1=/proc/net/dev；读不到返回 null。
+     *
+     * <p>原来的实现只看 sysfs。Android 10 上 untrusted_app 域没有
+     * {@code /sys/class/net/*} 的读权限，所以它在真机上从来返回 -1 —— 采样器静默空转。
+     * {@code /proc/net/dev} 是另一条路，权限模型不同，多数机型可读。
+     */
+    private long[] readIfaceStat(String field) {
+        // ① sysfs：最准，但常被 SELinux 挡
+        for (int i = 0; i < 2; i++) {
+            String iface = (i == 0) ? "p2p0" : "wlan0";
             try {
                 java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(
-                        "/sys/class/net/" + iface + "/statistics/" + name));
+                        "/sys/class/net/" + iface + "/statistics/" + field));
                 String line = r.readLine();
                 r.close();
-                if (line != null) {
-                    return Long.parseLong(line.trim());
-                }
+                if (line != null) return new long[]{Long.parseLong(line.trim()), i};
             } catch (Throwable ignored) {
-                // 权限或接口不存在 → 试下一个
+                // 试下一个
             }
         }
-        return -1L;
+        // ② /proc/net/dev：列顺序固定，按接口名找行
+        final int col;
+        switch (field) {
+            case "rx_bytes":   col = 0;  break;
+            case "rx_dropped": col = 3;  break;
+            case "tx_bytes":   col = 8;  break;
+            default: return null;
+        }
+        try {
+            java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader("/proc/net/dev"));
+            String line;
+            while ((line = r.readLine()) != null) {
+                int c = line.indexOf(':');
+                if (c < 0) continue;
+                String name = line.substring(0, c).trim();
+                if (!"p2p0".equals(name) && !"wlan0".equals(name)) continue;
+                String[] parts = line.substring(c + 1).trim().split("\\s+");
+                if (parts.length <= col) continue;
+                long v = Long.parseLong(parts[col]);
+                r.close();
+                return new long[]{v, "p2p0".equals(name) ? 0L : 1L};            }
+            r.close();
+        } catch (Throwable ignored) {
+            // 两条路都不通 → 由调用方记一次 warn
+        }
+        return null;
     }
 
     private void startLinkStats() {

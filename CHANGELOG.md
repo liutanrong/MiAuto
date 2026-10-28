@@ -1,3 +1,57 @@
+# MiAuto 0.3.19 — 2026-10-28
+
+**Audio stutter + the connection P0s**
+
+The reported symptom set — "sound breaks up on Wi-Fi, not on USB; lowering resolution does not
+help; audio-only also stutters" — is what drove this round. A ~200 kbps audio stream cannot be
+bandwidth-starved while 8 Mbps of video over USB is fine, so bandwidth, codec load and the phone
+are all ruled out. What remains is the medium: P2P airtime scheduling.
+
+- **E1-1 WifiLock LOW_LATENCY.** `WIFI_MODE_FULL_HIGH_PERF` only keeps the radio awake; it does not
+  change airtime scheduling. `WIFI_MODE_FULL_LOW_LATENCY` (API 29; this unit is Android 10)
+  disables PS polling — its ~100 ms periodic latency spikes are exactly what starves an AudioTrack —
+  and places frames in the high-priority WMM queue. Falls back to HIGH_PERF if the OEM rejects it.
+- **E1-2 MulticastLock released on connect.** It is only useful before the link exists. Holding it
+  makes the chip wake on every DTIM to receive multicast frames, stealing airtime from audio.
+- **E1-3 UNII-3 only.** The group kept landing on 5180 MHz (ch36, UNII-1: lower power ceiling,
+  usually 20 MHz). The allowed list now defaults to 149/153/157/161. Opt out with
+  `iccoa-5g-unii3-only=0`.
+- **E2-1/E2-2 stop hurting ourselves.** The smoothness probe ran PixelCopy on the video SurfaceView
+  4×/s for 30 s — a GPU sync point on the render path, i.e. a stutter generator used to measure
+  stutter. Off by default now (`iccoa-smooth-probe`); first-frame probing is 500 ms × 15 s instead
+  of 250 ms × 60 s.
+- **E3-3 audio focus answered.** `onAudioFocusChanged` was an empty override with no logging, and
+  `UCarAudioManager.allowGainAudioFocus()` was never called. Now logged and always granted — nothing
+  else competes for audio on the head unit.
+
+Connection:
+
+- **A1 `stopCast` is private.** 0.3.18 called `getMethod("stopCast")`, which only searches public
+  members; the dex says `direct PRIVATE V stopCast()`. D2 therefore never ran a single time. Now
+  `getDeclaredMethod` + `setAccessible`, and on failure the full method list is dumped so we never
+  have to guess again.
+- **A2 USB priority deadlock.** `usbPriorityFallback` bailed out on `castStarted`, which the AOA
+  branch sets just by pre-arming the decoder. The 10 s fallback to BLE advertising could never fire,
+  so the 12 s stall watchdog kept disconnecting: 5 rounds / 4 min 37 s on 10/27, until the cable was
+  physically replugged. Now guarded by `lastProgress > 0`.
+- **A8** cold-start window 4000 → 2000 ms. Six successful first frames measured 43 / 423 / 430 /
+  433 / 454 / 455 ms — when the window expires the frame is not late, it is never coming.
+- **A3–A7** diagnostics: round result printed after `connectType` arrives (was `通道=未知` 10/12
+  times); `[通道]` deduplicated (was 4 lines per session); replay scheduling keeps the *earliest*
+  deadline instead of logging `+5000ms` and `+800ms` at the same instant; `startCast` timing prints
+  `n/a` instead of a 20-day number; a stopped-state ack is no longer logged as an abnormal
+  disconnect.
+- **E5 resolution actually applies.** `buildConfig()` now recomputes the canvas every time and the
+  log prints `resolutionId`. It used to be computed once at activity start — which is why all 12
+  sessions on 10/28 reported 1280x672 no matter what was selected.
+- **E3-1/E3-2 forensics that cannot lie to us.** Link sampling now also reads `/proc/net/dev`
+  (sysfs is blocked for untrusted apps on this unit — that is why `[链路]` never appeared) and
+  reports dropped packets plus RSSI / link speed / frequency. The report now also pulls
+  AudioFlinger / AudioTrack / WifiP2p / wpa_supplicant lines and the first 40 lines of the newest
+  crash file.
+- **B1/B3** decoder instance fingerprint (`VideoPlayerV2@hash`) on every rebuild, to settle whether
+  "reused decoder" — not "new decoder" — is what makes the second session work.
+
 # MiAuto 0.3.18 — 2026-10-26
 
 **D1/D2/D4/D5/D6/D8/D10/D11 (D3 and D7 not in this round)**

@@ -53,6 +53,21 @@ object DiagnosticReport {
         //   权限/参数不支持的情况。
         runCatching { readCrashBuffer().forEach(::accept) }
             .onFailure { accept("[diagnostic] crash logcat unavailable: ${it.message}") }
+
+        // ★ 音频与射频（0.3.19 E3-2）。
+        //
+        //   「声音断续」这件事在原报告里是完全的盲区：诊断只抓 OPENHU 与 easylog_，
+        //   而音频输出走 AudioFlinger/AudioTrack，射频走 WifiP2pService/wpa_supplicant，
+        //   两边一条都不进来。没有这两组日志，就只能猜「是不是网络」。
+        //   只在诊断时段抓，不影响平时性能。
+        runCatching { readAudioRadioLogcat().forEach(::accept) }
+            .onFailure { accept("[diagnostic] audio/radio logcat unavailable: ${it.message}") }
+
+        // ★ 崩溃文件正文（0.3.19 B2）。
+        //   10/28 的 0.3.18 崩了两次，但报告里只有 App 启动时那句「[崩溃记录] xxx.txt」，
+        //   栈根本没进报告 —— 等于知道崩了却不知道崩在哪。这里把最新一份的前 40 行带上。
+        runCatching { readLatestCrashFile(context).forEach(::accept) }
+            .onFailure { accept("[diagnostic] crash file unavailable: ${it.message}") }
         return buildString {
             appendLine("DiAuto ${context.packageManager.getPackageInfo(context.packageName, 0).versionName} · diagnostic report")
             appendLine("Android=${Build.VERSION.RELEASE}; API=${Build.VERSION.SDK_INT}")
@@ -100,6 +115,57 @@ object DiagnosticReport {
             }
         } finally {
             process.destroy()
+        }
+    }
+
+    /**
+     * 音频 / 射频侧日志（0.3.19 E3-2）。
+     *
+     * <p>覆盖三类：
+     * <ul>
+     *   <li>AudioFlinger / AudioTrack / AudioPolicy —— 欠载（underrun）、缓冲、
+     *       采样率切换，是「声音断续」最直接的证据</li>
+     *   <li>WifiP2p / wpa_supplicant / WifiHAL —— 组建立、掉线、信道切换、重传</li>
+     *   <li>lowmemorykiller / Choreographer —— 排除「被系统杀 / 主线程卡住」</li>
+     * </ul>
+     * 上限 500 行：这组日志量不小，太多会把报告主体冲掉。
+     */
+    private fun readAudioRadioLogcat(): List<String> {
+        val process = ProcessBuilder("logcat", "-d", "-v", "threadtime")
+            .redirectErrorStream(true).start()
+        return try {
+            process.inputStream.bufferedReader().useLines { input ->
+                input.filter { line ->
+                    val t = line.lowercase()
+                    t.contains("audioflinger") || t.contains("audiotrack") ||
+                        t.contains("audiopolicy") || t.contains("ucar_audio") ||
+                        t.contains("wifip2p") || t.contains("wpa_supplicant") ||
+                        t.contains("wifihal") || t.contains("lowmemorykiller") ||
+                        t.contains("underrun") || t.contains("glitch")
+                }.take(500).toList()
+            }
+        } finally {
+            process.destroy()
+        }
+    }
+
+    /**
+     * 最新一份 crash-*.txt 的正文（0.3.19 B2）。
+     *
+     * <p>只取前 40 行：Java 栈的头 40 行已经能看出异常类型 + 前几层调用，
+     * 再多的帧对定位帮助有限，反而挤占日志预算。
+     */
+    private fun readLatestCrashFile(context: Context): List<String> {
+        val dir = context.getExternalFilesDir(null) ?: return emptyList()
+        val files = dir.listFiles { f -> f.isFile && f.name.startsWith("crash-") && f.name.endsWith(".txt") }
+            ?: return emptyList()
+        val latest = files.maxByOrNull { it.lastModified() } ?: return emptyList()
+        val head = latest.readLines().take(40)
+        if (head.isEmpty()) return emptyList()
+        return buildList {
+            add("[crash] ==== ${latest.name}（共 ${latest.readLines().size} 行，此处前 ${head.size} 行）====")
+            addAll(head)
+            add("[crash] ==== 结束 ====")
         }
     }
 
