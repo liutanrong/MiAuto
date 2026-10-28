@@ -1,3 +1,51 @@
+# MiAuto 0.3.20 — 2026-10-28
+
+**Crash root cause found + four diagnostics fixes**
+
+0.3.19 verified well where it mattered: `WifiLock(LOW_LATENCY)` took, the group moved from
+5180 MHz (ch36) to **5745 MHz (ch149)**, MulticastLock is released on connect, and D2 finally ran —
+`[重建] 已释放 VideoPlayerV2(VideoPlayerV2@b9d527c)` followed by a **158 ms** first frame. The
+first session of a process no longer needs a disconnect/reconnect cycle.
+
+This round closes what the same report exposed.
+
+- **Crash root cause (the real one).** Not a decoder or a race — Direct Boot:
+  ```
+  Unable to create application ... IllegalStateException: SharedPreferences in credential
+  encrypted storage are not available until after user is unlocked
+      at Settings.getPrefs(Settings.kt:29)
+      at AppComponent.<init>(AppComponent.kt:18)
+      at App.onCreate(App.kt:47)
+  ```
+  Boot auto-start fires before the head unit is unlocked, and `App.onCreate` touched
+  `component.suExecutor`, which constructs `AppComponent`, which reads SharedPreferences. Fixed in
+  three places: `component` access moved inside the `isUserUnlocked()` branch; `Settings` falls back
+  to `createDeviceProtectedStorageContext()`; `debugForceMemoryProfile` is read under `runCatching`.
+- **A3 round-result channel still "unknown" 1 in 2 times.** A fixed 600 ms delay is not enough —
+  one session had state=4 and state=2 **850 ms** apart. Now it polls until `connectType` lands,
+  capped at 2 s.
+- **First-frame timing leaked across sessions.** `tProgress100` survived `onSurfaceDestroyed`, so a
+  resumed session printed `首帧 距 progress100 152095ms`. Both counters are cleared now.
+- **Link sampling: third path.** `/proc/net/dev` is blocked for untrusted apps on this unit too
+  (0.3.19 printed `采样不可用`). Added `TrafficStats.getTotalRxBytes/getTotalTxBytes` as a last
+  resort — machine-wide counters, labelled `全机` so nobody mistakes them for p2p0.
+- **Audio focus: do not grab on loss.** `focus=-5` arrives during teardown; granting then is
+  backwards. Only non-negative (gain) events call `allowGainAudioFocus()`.
+
+**On the stutter itself.** The expanded logcat finally shows the audio path:
+
+```
+UCar_AudioPlayer@STREAM_CAST_MUSIC.Play: wait buffer to fill bytes: 57600
+UCar_AudioPlayer@STREAM_CAST_MUSIC.Play: buffer fill done, number: 15, bytes: 61440
+UCar_AudioQueueManager-aac@STREAM_CAST_MUSIC: buffer queue size: 0, total: 11400
+```
+
+Audio is AAC-over-network, decoded on the head unit, and the player re-fills a 57600-byte cushion
+(0.3–0.6 s) before every start. In the captured window it did so at 42.705 s, 44.271 s and
+44.663 s — twice in 1.5 seconds. A cushion that keeps being rebuilt means the stream keeps running
+dry, which is exactly what "sound breaks up" sounds like. That buffer lives inside the SDK; the
+only lever we have is making delivery more continuous, which is what the 0.3.19 Wi-Fi changes aim at.
+
 # MiAuto 0.3.19 — 2026-10-28
 
 **Audio stutter + the connection P0s**

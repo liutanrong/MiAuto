@@ -17,11 +17,27 @@ import com.andrerinas.openheadunit.connection.UsbDeviceCompat
 
 class Settings(private val context: Context) {
 
+    /**
+     * 0.3.20：锁屏期（Direct Boot）不再抛异常，退回设备保护存储。
+     *
+     * <p>原实现只试凭据加密存储，拿到 null 就在 {@link #prefs} 里抛
+     * {@code IllegalStateException("...not available until after user is unlocked")}。
+     * 只要有<b>任何一条</b>路径在开机自启、用户尚未解锁时碰到 Settings，整个进程就崩
+     * —— 0.3.18 在 10/27 18:35 连崩两次，栈头就是这句。
+     *
+     * <p>{@code createDeviceProtectedStorageContext()} 在解锁前就可用；里面那份数据
+     * 是 {@code syncAutoStart*ToDeviceStorage()} 同步过去的少量自启开关，够锁屏期用了。
+     */
     private val _prefs: SharedPreferences? by lazy {
         try {
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         } catch (e: Exception) {
-            null
+            try {
+                context.createDeviceProtectedStorageContext()
+                    ?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            } catch (e2: Exception) {
+                null
+            }
         }
     }
 

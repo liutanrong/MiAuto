@@ -87,8 +87,8 @@ android {
         applicationId = "com.miauto.app"
         minSdk = 16
         targetSdk = 36
-        versionCode = 319
-        versionName = "0.3.19"
+        versionCode = 320
+        versionName = "0.3.20"
         setProperty("archivesBaseName", "${applicationId}_${versionName}")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         multiDexEnabled = true

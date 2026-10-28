@@ -913,6 +913,12 @@ public class IccoaManager {
         primingPhase = false;
         cancelEarlyBail();
         cancelCastStallWatchdog();
+        // ★ 0.3.20：诊断计时也要跟着清。
+        //   投屏页关掉后 SDK 仍停在 progress 100，下一场是「恢复」而不是「新协商」，
+        //   tProgress100 留着上一场的值 → 首帧那行打出「距 progress100 152095ms」
+        //   （10/28 22:xx 的第三次会话就是这个），报告一打开就像出了大事故。
+        tProgress90 = 0L;
+        tProgress100 = 0L;
         logCapabilities();
         cancelGpsTick();
         stopLinkStats();
@@ -1437,20 +1443,29 @@ public class IccoaManager {
             return;
         }
         roundResultLogged = true;
-        // ★ 0.3.19（A3）：成功后延后 600ms 再打这一行。
+        // ★ 0.3.19（A3）：成功后等 connectType 落定再打这一行。
         //
         //   10/28 报告里 12 条「第 N 轮结果」有 10 条写「通道=未知」——
         //   因为 state=4(CAST_CONNECTED) 到达时 connectType 还没写进 stats，
-        //   要等 20~40ms 后那条 state=2(CONNECTED) 才带上类型。
-        //   延后一拍，通道就能写对；轮次与起点都取快照，避免和下一轮串号。
+        //   要等后面那条 state=2(CONNECTED) 才带上类型。
+        // ★ 0.3.20：固定延后 600ms 仍不够 —— 10/28 22:xx 那场 state=4 与 state=2
+        //   相隔 850ms，结果还是打成「未知」。改成轮询：connectType 一有值就打，最多等 2 秒。
         final int round = connectRound;
         final long startMs = connectRoundStartMs;
         final int stage = lastProgress;
-        main.postDelayed(() -> {
-            long ms = startMs == 0L ? -1L : System.currentTimeMillis() - startMs;
-            log("[连接] 第 " + round + " 轮结果=" + result + " 通道=" + channelShort()
-                    + (ms >= 0 ? " 用时=" + ms + "ms" : "") + " 阶段=" + stage + "%");
-        }, 600L);
+        waitAndLogRoundLine(round, startMs, stage, 0);
+    }
+
+    /** A3 的轮询体：等 connectType 落定（最多 2 秒）再打轮结果。 */
+    private void waitAndLogRoundLine(int round, long startMs, int stage, int attempt) {
+        final boolean ready = stats.connectType != -1 || isAoaActive() || attempt >= 8;
+        if (!ready) {
+            main.postDelayed(() -> waitAndLogRoundLine(round, startMs, stage, attempt + 1), 250L);
+            return;
+        }
+        long ms = startMs == 0L ? -1L : System.currentTimeMillis() - startMs;
+        log("[连接] 第 " + round + " 轮结果=成功 通道=" + channelShort()
+                + (ms >= 0 ? " 用时=" + ms + "ms" : "") + " 阶段=" + stage + "%");
     }
 
     /** 立即打一行轮结果（失败/断开等不需要等 connectType 的场合）。 */
@@ -2673,7 +2688,11 @@ public class IccoaManager {
          */
         @Override
         public void onAudioFocusChanged(UCarCommon.AudioType type, int focus) {
-            log("[音频] 焦点回调 type=" + type + " focus=" + focus + " → 放行");
+            log("[音频] 焦点回调 type=" + type + " focus=" + focus
+                    + (focus < 0 ? " → 丢失/释放，不抢占" : " → 放行"));
+            // 0.3.20：focus < 0 是 LOSS/释放，这时候去 allowGain 反而是抢，
+            // 断开瞬间那条 focus=-5 就是这类。只在真正的 GAIN 上放行。
+            if (focus < 0) return;
             main.post(IccoaManager.this::allowGainAudioFocusForSdk);
         }
 
@@ -3195,12 +3214,13 @@ public class IccoaManager {
                 if (sec > 0.5) {
                     double rxMbps = (rx[0] - linkRxPrev) * 8 / sec / 1_000_000.0;
                     double txMbps = (tx[0] - linkTxPrev) * 8 / sec / 1_000_000.0;
-                    long dDrop = (drop != null && linkDropPrev >= 0) ? (drop[0] - linkDropPrev) : 0L;
+                    long dDrop = (drop != null && linkDropPrev >= 0) ? (drop[0] - linkDropPrev) : -1L;
                     // 每 10 秒记一行，避免把日志刷成流量计
                     if ((linkTick++ & 1) == 0) {
                         log(String.format(java.util.Locale.US,
-                                "[链路] %s 收 %.1f Mbps / 发 %.1f Mbps / 新增丢包 %d%s",
-                                rx[1] == 0L ? "p2p0" : "wlan0", rxMbps, txMbps, dDrop, wifiRadio()));
+                                "[链路] %s 收 %.1f Mbps / 发 %.1f Mbps / 新增丢包 %s%s",
+                                rx[1] == 0L ? "p2p0" : rx[1] == 1L ? "wlan0" : "全机",
+                                rxMbps, txMbps, dDrop < 0 ? "n/a" : String.valueOf(dDrop), wifiRadio()));
                     }
                 }
             }
@@ -3285,9 +3305,29 @@ public class IccoaManager {
                 return new long[]{v, "p2p0".equals(name) ? 0L : 1L};            }
             r.close();
         } catch (Throwable ignored) {
-            // 两条路都不通 → 由调用方记一次 warn
+            // 两条路都不通 → 再试 TrafficStats
+        }
+        // ③ TrafficStats：全机计数，不区分接口。
+        //   0.3.19 试过 /proc/net/dev，本机同样读不到（SELinux 挡 untrusted_app）——
+        //   日志里就是那句「采样不可用」。这条路一定能拿到，代价是「全机流量」而不是
+        //   「p2p0 流量」。车机在投屏时基本只有这一条流，用来判断「数据有没有在动、
+        //   速率大概多少、有没有长时间归零」够用。丢包拿不到，返回 null 即可。
+        try {
+            long v = -1L;
+            if ("rx_bytes".equals(field)) {
+                v = android.net.TrafficStats.getTotalRxBytes();
+            } else if ("tx_bytes".equals(field)) {
+                v = android.net.TrafficStats.getTotalTxBytes();
+            }
+            if (v > 0L) return new long[]{v, 2};
+        } catch (Throwable ignored) {
         }
         return null;
+    }
+
+    /** 采样来源的可读名（0=p2p0 / 1=wlan0 / 2=全机合计）。 */
+    private String ifaceName(long idx) {
+        return idx == 0L ? "p2p0" : idx == 1L ? "wlan0" : "全机";
     }
 
     private void startLinkStats() {

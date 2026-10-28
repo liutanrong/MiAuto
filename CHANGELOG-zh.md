@@ -1,3 +1,49 @@
+# MiAuto 0.3.20 — 2026-10-28
+
+**崩溃根因找到 + 四项诊断修正**
+
+0.3.19 该生效的都生效了：`WifiLock(LOW_LATENCY)` 拿到、组频段从 5180MHz（ch36）跳到
+**5745MHz（ch149）**、MulticastLock 建链即释放，D2 也终于跑起来了 ——
+`[重建] 已释放 VideoPlayerV2(VideoPlayerV2@b9d527c)` 之后 **158ms** 就出画。
+本进程的第一场不再需要"断开重连"那一轮。
+
+这轮补上同一份报告暴露出来的四件事，外加一个真正的崩溃根因。
+
+- **崩溃根因（实锤）**：不是解码器、不是竞态，是 Direct Boot 解锁时序：
+  ```
+  Unable to create application ... IllegalStateException: SharedPreferences in credential
+  encrypted storage are not available until after user is unlocked
+      at Settings.getPrefs(Settings.kt:29)
+      at AppComponent.<init>(AppComponent.kt:18)
+      at App.onCreate(App.kt:47)
+  ```
+  开机自启发生在车机解锁之前，而 `App.onCreate` 一路摸到 `component.suExecutor` →
+  构造 `AppComponent` → 读 SharedPreferences。三处都堵上：`component` 的访问移进
+  `isUserUnlocked()` 分支；`Settings` 退回 `createDeviceProtectedStorageContext()`；
+  `debugForceMemoryProfile` 用 `runCatching` 兜。
+- **A3 轮结果仍有 1/2 次写"通道=未知"**：固定延后 600ms 不够 —— 有一场 state=4 和 state=2
+  相隔 **850ms**。改成轮询等 `connectType` 落定，上限 2 秒。
+- **首帧计时跨会话串场**：`tProgress100` 在 `onSurfaceDestroyed` 后没清，恢复会话打出
+  `首帧 距 progress100 152095ms`。两个计时器都清零。
+- **链路采样第三条路**：本机 `/proc/net/dev` 同样被挡（0.3.19 打的就是「采样不可用」）。
+  改用 `TrafficStats.getTotalRxBytes/getTotalTxBytes` 兜底 —— 全机计数，标签写「全机」，
+  不冒充 p2p0。
+- **音频焦点丢失不再抢**：`focus=-5` 出现在断开瞬间，这时候 `allowGainAudioFocus()` 是反的。
+  只在非负（GAIN）时放行。
+
+**关于断续本身。** 扩大的 logcat 终于看到音频链路：
+
+```
+UCar_AudioPlayer@STREAM_CAST_MUSIC.Play: wait buffer to fill bytes: 57600
+UCar_AudioPlayer@STREAM_CAST_MUSIC.Play: buffer fill done, number: 15, bytes: 61440
+UCar_AudioQueueManager-aac@STREAM_CAST_MUSIC: buffer queue size: 0, total: 11400
+```
+
+音频是 AAC 走网络、车机侧解码，播放器每次起播前要攒 57600 字节（0.3~0.6 秒）的垫子。
+抓到的窗口里它在 42.705s、44.271s、44.663s 各攒了一次 —— **1.5 秒内重攒两次**。
+垫子反复重建，说明流反复见底，这正是"声音断一下"的物理形态。
+这块缓冲在 SDK 内部，我们能动的只有"让数据来得更连续"，也就是 0.3.19 那几条 Wi-Fi 改动的方向。
+
 # MiAuto 0.3.19 — 2026-10-28
 
 **声音断续 + 连接 P0**

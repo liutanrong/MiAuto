@@ -43,10 +43,18 @@ class App : Application() {
             ConscryptInitializer.initialize()
         }
 
-        // Root support
-        component.suExecutor.register()
+        // Root support（0.3.20：移到解锁判断之后）。
+        //
+        // ★ 这里原来是全局调用，而 `component` 是 lazy，第一次访问就会构造 AppComponent，
+        //   里面 new Settings(app) + 读 debugForceMemoryProfile → 直接碰 SharedPreferences。
+        //   开机自启（BOOT_COMPLETED）时用户还没解锁，凭据加密存储不可用 →
+        //   IllegalStateException → "Unable to create application" → 进程秒崩。
+        //   10/27 18:35 那两次 FATAL EXCEPTION 就是这个（PID 2937 / 2227，间隔 1.8 秒，
+        //   正好是系统连着重启了两次）。栈已在 0.3.19 的报告里拿到实锤。
 
         if (isUserUnlocked()) {
+            component.suExecutor.register()
+
             val settings = Settings(this) // Create a Settings instance
             AppLog.init(settings, this) // Initialize AppLog with settings for conditional logging
 
