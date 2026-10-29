@@ -59,6 +59,17 @@ public final class IccoaPrefs {
      */
     public static final String KEY_USB_PRIORITY = "iccoa-usb-priority";
 
+    /**
+     * 会话期间把 CPU governor 切到 performance（0.3.21）。默认关。
+     *
+     * <p>针对「断音随机、很短、之后一下补齐」这个特征：数据没丢，是时序抖动。
+     * 车机若跑 schedutil/powersave，音频线程被唤醒时要先等频率爬升，那几十毫秒
+     * 刚好够把 AudioTrack 抽干。开关打开后只在会话期间生效，断开即还原。
+     *
+     * <p>需要 root。没有 su 时自动跳过并记一行日志，不影响投屏本身。
+     */
+    public static final String KEY_CPU_PERF = "iccoa-cpu-perf";
+
     public static int getInt(Context ctx, String key, int def) {
         try {
             return prefs(ctx).getInt(key, def);

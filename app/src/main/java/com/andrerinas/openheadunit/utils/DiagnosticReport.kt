@@ -2,6 +2,7 @@ package com.andrerinas.openheadunit.utils
 
 import android.content.Context
 import android.os.Build
+import com.miauto.app.CpuTuner
 import java.util.ArrayDeque
 
 /** Small, shareable report. Never exports saved credentials or raw protocol payloads. */
@@ -63,6 +64,16 @@ object DiagnosticReport {
         runCatching { readAudioRadioLogcat().forEach(::accept) }
             .onFailure { accept("[diagnostic] audio/radio logcat unavailable: ${it.message}") }
 
+        // ★ AudioFlinger 欠载计数（0.3.21）。
+        //
+        //   0.3.20 的报告里音频段只剩 118 行 / 4 秒 —— logcat 尾巴被
+        //   UCar_AudioQueueManager-pcm 的 "size: 10" 常规行占满了，一次 underrun 现场
+        //   都没落进窗口。上面的过滤已经压掉常规行，这里再补一份"计数器"：
+        //   dumpsys 的 underruns 字段是累计值，不受采样窗口影响，能直接回答
+        //   「到底被抽干过几次」。需要 root，没有就写一行原因。
+        runCatching { readAudioFlingerUnderruns().forEach(::accept) }
+            .onFailure { accept("[diagnostic] audio_flinger dump unavailable: ${it.message}") }
+
         // ★ 崩溃文件正文（0.3.19 B2）。
         //   10/28 的 0.3.18 崩了两次，但报告里只有 App 启动时那句「[崩溃记录] xxx.txt」，
         //   栈根本没进报告 —— 等于知道崩了却不知道崩在哪。这里把最新一份的前 40 行带上。
@@ -76,6 +87,8 @@ object DiagnosticReport {
             appendLine("Hotspot auto-enable=${settings.autoEnableHotspot}; hotspot state=${SoftApStateReader.read(context)}")
             appendLine("Hotspot name saved=${settings.hotspotSsid.isNotBlank()}; password saved=${settings.hotspotPassword.isNotEmpty()}")
             appendLine("Logging level=${settings.exporterLogLevel}; source=${settings.logSource}")
+            runCatching { appendLine("CPU: ${CpuTuner.snapshot()}") }
+            runCatching { appendLine("SU: ${CpuTuner.probe()}") }
             appendLine("Saved credentials, network addresses and protocol payloads are omitted.")
             appendLine("--- Recent app logs (up to 6000 lines) ---")
             if (lines.isEmpty()) appendLine("No recent app logs available. Reproduce the issue and save a new report.")
@@ -119,7 +132,7 @@ object DiagnosticReport {
     }
 
     /**
-     * 音频 / 射频侧日志（0.3.19 E3-2）。
+     * 音频 / 射频侧日志（0.3.19 E3-2，0.3.21 改过滤策略）。
      *
      * <p>覆盖三类：
      * <ul>
@@ -128,24 +141,76 @@ object DiagnosticReport {
      *   <li>WifiP2p / wpa_supplicant / WifiHAL —— 组建立、掉线、信道切换、重传</li>
      *   <li>lowmemorykiller / Choreographer —— 排除「被系统杀 / 主线程卡住」</li>
      * </ul>
-     * 上限 500 行：这组日志量不小，太多会把报告主体冲掉。
+     *
+     * <p><b>0.3.21 的改动：</b>0.3.20 的报告里这一段只剩 118 行、覆盖 4 秒 ——
+     * {@code UCar_AudioQueueManager-pcm: buffer queue size: 10} 每秒刷十余条，
+     * 把 500 行的配额全吃掉了，真正有价值的 {@code wait buffer to fill} 一条没进来。
+     * 现在把「队列满」的常规行按 30:1 抽样，省下的额度全部让给异常行，
+     * 上限同时提到 760。
      */
     private fun readAudioRadioLogcat(): List<String> {
         val process = ProcessBuilder("logcat", "-d", "-v", "threadtime")
             .redirectErrorStream(true).start()
         return try {
+            val out = ArrayList<String>(800)
+            var routineSeen = 0
             process.inputStream.bufferedReader().useLines { input ->
-                input.filter { line ->
+                input.forEach { line ->
                     val t = line.lowercase()
-                    t.contains("audioflinger") || t.contains("audiotrack") ||
+                    val hit = t.contains("audioflinger") || t.contains("audiotrack") ||
                         t.contains("audiopolicy") || t.contains("ucar_audio") ||
                         t.contains("wifip2p") || t.contains("wpa_supplicant") ||
                         t.contains("wifihal") || t.contains("lowmemorykiller") ||
                         t.contains("underrun") || t.contains("glitch")
-                }.take(500).toList()
+                    if (!hit) return@forEach
+                    if (isRoutineQueueLine(t)) {
+                        routineSeen++
+                        if (routineSeen % 30 != 0) return@forEach
+                    }
+                    if (out.size < 760) out.add(line)
+                }
             }
+            out
         } finally {
             process.destroy()
+        }
+    }
+
+    /** 队列满的常规行：{@code buffer queue size: 9..N}。这类行只在掉水位时才有信息量。 */
+    private val queueSizeRe = Regex("buffer queue size:\\s*(\\d+)")
+
+    private fun isRoutineQueueLine(lower: String): Boolean {
+        if (!lower.contains("ucar_audioqueuemanager")) return false
+        val n = queueSizeRe.find(lower)?.groupValues?.get(1)?.toIntOrNull() ?: return false
+        return n >= 9
+    }
+
+    /**
+     * AudioFlinger 的累计欠载计数（0.3.21）。
+     *
+     * <p>为什么一定要这一份：logcat 是环形缓冲，只留最近几秒；而「断一下」是秒级以下
+     * 的事件，靠抽日志碰运气。{@code dumpsys media.audio_flinger} 里的 underruns
+     * 是**从 track 创建起的累计值**，采样窗口再窄也不影响它 —— 有增长就说明硬件缓冲
+     * 真的被抽干过，没有增长就说明声音一直有货、问题在别处。
+     *
+     * <p>需要 root。普通 App 调 dumpsys 会被 DUMP 权限挡掉，这里直接走 su。
+     */
+    private fun readAudioFlingerUnderruns(): List<String> {
+        if (!CpuTuner.rootGranted()) {
+            return listOf("[audio] dumpsys 跳过：su 未授权，无法读 AudioFlinger 计数")
+        }
+        val dump = CpuTuner.exec("dumpsys media.audio_flinger")
+            ?: return listOf("[audio] dumpsys media.audio_flinger 执行失败")
+        val picked = dump.lineSequence()
+            .filter { it.contains("underrun", ignoreCase = true) }
+            .take(40)
+            .toList()
+        if (picked.isEmpty()) {
+            return listOf("[audio] dumpsys 无 underrun 字段（该版本可能不统计，或本次没有 track）")
+        }
+        return buildList {
+            add("[audio] ==== AudioFlinger underrun（${picked.size} 行，累计值）====")
+            addAll(picked)
         }
     }
 

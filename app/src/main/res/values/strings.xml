@@ -1083,6 +1083,9 @@
     <string name="setup_usb_priority">USB priority</string>
     <string name="setup_usb_priority_toggle">Use the cable when one is plugged in</string>
     <string name="setup_usb_priority_hint">On by default. Once a wireless link completes its handshake, the ICCOA SDK stops advertising — the cable then has no way in. With this on, connecting a USB accessory stops the Bluetooth advertisement so the phone can only use the cable. Turn it off if you prefer "whichever connects first".</string>
+    <string name="setup_cpu_perf">Audio smoothness</string>
+    <string name="setup_cpu_perf_toggle">Keep the CPU at full speed while casting</string>
+    <string name="setup_cpu_perf_hint">Off by default. Addresses audio that cuts out randomly for a fraction of a second and then catches up all at once — the data is not lost, it arrives late. On a head unit running schedutil or powersave the audio thread has to wait for the clock to ramp up, and those tens of milliseconds are enough to drain the output buffer. This switches the governor to performance for the session only and restores it the moment you disconnect. Needs root; without it the option is skipped and noted in the log. The CPU stays at full speed while casting, so expect slightly more heat.</string>
     <string name="icoca_paused_hint">Disconnected · tap Refresh code to reconnect</string>
     <string name="icoca_advertise_retry">Bluetooth broadcasting retry #%1$d</string>
     <string name="icoca_5g_only">Prefer 5 GHz</string>

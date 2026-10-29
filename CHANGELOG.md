@@ -1,3 +1,38 @@
+# MiAuto 0.3.21 — 2026-10-29
+
+**Audio dropouts narrowed: nothing is lost, it is timing. Instruments first, then one optional knife**
+
+The 10/29 feedback was "still drops, but better", plus three characteristics: **random, very
+short, and then it all catches up at once**. Together those rule out packet loss — a one-way
+real-time stream that loses packets has permanent gaps and cannot catch up. Catching up means
+every sample arrived, just late. The bottleneck moves from bandwidth to timing.
+
+USB is fine and Wi-Fi is not, and the difference is that every packet interrupts the CPU. A
+Snapdragon 665 head unit usually runs schedutil or powersave: low clock at idle, so the audio
+thread has to wait for the ramp-up, and those tens of milliseconds are enough to drain the
+AudioTrack. This version does not bet on that hypothesis — it adds the instruments first and
+ships one switchable lever.
+
+- **A1 audio log filtering rewritten.** 0.3.20's audio section was 118 lines covering 4 seconds:
+  `UCar_AudioQueueManager-pcm: buffer queue size: 10` prints a dozen lines a second and ate the
+  whole 500-line quota, so `wait buffer to fill` never made it in. Full-queue lines are now
+  sampled 30:1 and the budget goes to anomalies, cap raised to 760.
+- **A2 in-session CPU sampling.** Every 10 s, one line: governor plus all eight core frequencies.
+  Dropouts are sub-second and cannot be caught live, but "what was the clock when it dropped"
+  can be reconstructed from the timeline.
+- **A3 AudioFlinger underrun counter.** On session end, `dumpsys media.audio_flinger`, filtered to
+  `underrun`. It is cumulative, so a narrow log window does not matter — the delta between two
+  sessions is how many times the buffer was actually drained.
+- **A4 su identity probe.** One `id` line at session start. Without it, "do we have root" was
+  guesswork.
+- **B CPU governor switch (off by default).** Settings → connection → "Audio smoothness". Switches
+  to `performance` for the session and restores on disconnect; the original value is recorded and
+  restored once at app start, so a killed process cannot leave the unit pinned at full clock.
+  Skips itself with a logged reason when there is no su or the kernel lacks the governor.
+- **Build fix.** `injectIccoaDex` treated an *empty* `ANDROID_HOME` as valid, resolved it to the
+  project root, and silently fell back to a hard-coded Windows path. Blank values are now skipped
+  and `local.properties`'s `sdk.dir` is honoured.
+
 # MiAuto 0.3.20 — 2026-10-28
 
 **Crash root cause found + four diagnostics fixes**

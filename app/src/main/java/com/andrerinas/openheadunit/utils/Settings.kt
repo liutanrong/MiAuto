@@ -1623,6 +1623,19 @@ class Settings(private val context: Context) {
         get() = prefs.getInt("iccoa-usb-priority", 1) != 0
         set(value) = prefs.edit().putInt("iccoa-usb-priority", if (value) 1 else 0).apply()
 
+    // 会话期间把 CPU governor 切到 performance（0.3.21）。
+    //
+    // 默认关。它治的是「断音随机、很短、之后一下补齐」—— 数据没丢，是时序抖动：
+    // 车机跑 schedutil/powersave 时，音频线程被唤醒得先等频率爬升，那几十毫秒
+    // 刚好够把 AudioTrack 抽干。开关打开后只在会话期间生效，断开立刻还原，
+    // 进程被杀也有启动兜底（CpuTuner.restore）。
+    //
+    // 需要 root，没有 su 时自动跳过。代价是会话期间 CPU 常驻高频、发热略增，
+    // 所以做成可选。
+    var cpuPerformance: Boolean
+        get() = prefs.getInt("iccoa-cpu-perf", 0) != 0
+        set(value) = prefs.edit().putInt("iccoa-cpu-perf", if (value) 1 else 0).apply()
+
     // Whether the Native AA handshake opens with a WifiVersionRequest (Type 4), as real head units
     // and the OEM ZLink app do, instead of going straight to WifiStartRequest.
     //

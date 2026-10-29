@@ -110,6 +110,20 @@ class ConnectionSetupFragment : Fragment() {
             })
             text(box, getString(R.string.setup_usb_priority_hint), 16)
         }
+        // 声音流畅度（0.3.21）。和 USB 优先并列：都在回答「这条链路还能怎么让它更稳」。
+        card(root, getString(R.string.setup_cpu_perf)) { box ->
+            box.addView(androidx.appcompat.widget.SwitchCompat(requireContext()).apply {
+                text = getString(R.string.setup_cpu_perf_toggle)
+                setTextColor(color(R.color.da_text))
+                minHeight = dp(60)
+                isChecked = settings.cpuPerformance
+                setOnCheckedChangeListener { _, checked ->
+                    settings.cpuPerformance = checked
+                    render()
+                }
+            })
+            text(box, getString(R.string.setup_cpu_perf_hint), 16)
+        }
         if (pendingCarHotspotSetup || (settings.wifiConnectionMode == 3 && settings.nativeApTransport == 1)) {
             card(root, getString(R.string.setup_configure_hotspot)) { box ->
                 text(box, getString(R.string.setup_hotspot_instructions), 16)

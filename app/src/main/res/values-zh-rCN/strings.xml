@@ -1030,6 +1030,9 @@
     <string name="setup_usb_priority">USB 优先</string>
     <string name="setup_usb_priority_toggle">插着数据线时只走线</string>
     <string name="setup_usb_priority_hint">默认开启。无线一旦完成握手，ICCOA SDK 会立刻停掉蓝牙广播，数据线就再没有参与机会。打开这一项后，插入 USB 配件会停掉广播，让手机只能走数据线。想让「谁先连上算谁」就关掉它。</string>
+    <string name="setup_cpu_perf">声音流畅度</string>
+    <string name="setup_cpu_perf_toggle">投屏期间让 CPU 保持满频</string>
+    <string name="setup_cpu_perf_hint">默认关闭。它针对的是「随机断一下、很短、之后一下全补齐」——数据没丢，只是晚到了。车机跑 schedutil 或 powersave 时，音频线程被唤醒要先等频率爬升，那几十毫秒正好够把输出缓冲抽干。打开后只在投屏期间切到 performance，断开立刻还原。需要 root，没有就自动跳过并记一行日志。代价是投屏期间 CPU 常驻高频，发热略增。</string>
     <string name="icoca_paused_hint">已断开 · 点「刷新配对码」重新连接</string>
     <string name="icoca_advertise_retry">蓝牙广播重试中（第 %1$d 次）</string>
     <string name="icoca_5g_only">优先 5GHz</string>

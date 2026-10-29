@@ -512,6 +512,17 @@ public class IccoaManager {
     private volatile boolean sessionActive = false;
 
     /**
+     * 本场会话是否已经做过 CPU 档位处理（0.3.21）。
+     *
+     * <p>一次建链会先后收到 state=4(CAST_CONNECTED) 与 state=2(CONNECTED)，
+     * 两处都会走到「会话建立」分支。没有这个标志就会切两次档、打两条日志。
+     */
+    private volatile boolean cpuTuned = false;
+
+    /** CPU 采样间隔。10 秒：一场 10 分钟 60 行，占报告篇幅不到 1.5%。 */
+    private static final long CPU_SAMPLE_INTERVAL_MS = 10_000L;
+
+    /**
      * 会话结束后的重新广播。
      *
      * <p>车机端必须一直可被发现：手机断开后若不再广播，用户就得手动重启 App 才能重连。
@@ -680,6 +691,15 @@ public class IccoaManager {
     public IccoaManager(Context ctx, Listener listener) {
         this.appCtx = ctx.getApplicationContext();
         this.listener = listener;
+        // ★ 0.3.21 启动兜底：上一场若在会话中被杀，governor 会停在被改过的状态。
+        //   只有真的记过账才动，绝大多数启动这里是零开销。
+        try {
+            if (CpuTuner.hasPendingRestore(appCtx)) {
+                log("[CPU] 启动兜底：" + CpuTuner.restore(appCtx));
+            }
+        } catch (Throwable t) {
+            log("[CPU] 启动兜底失败: " + t);
+        }
     }
 
     public void setScreenSize(int w, int h) {
@@ -1382,7 +1402,77 @@ public class IccoaManager {
         linkLostArmed = false;
         fiveGLogged = false;
         main.removeCallbacks(linkLostRunnable);
+        stopCpuSampling();
+        if (cpuTuned) {
+            cpuTuned = false;
+            log("[CPU] " + CpuTuner.restore(appCtx));
+            dumpAudioUnderrunsAsync();
+        }
         log("· 会话清理（" + reason + "）");
+    }
+
+    // ── 0.3.21：CPU 档位采样与 AudioFlinger 欠载计数 ──────────────────────
+
+    /**
+     * 会话期间每 10 秒记一行 8 核实时频率。
+     *
+     * <p>断音是亚秒级事件，靠抓帧没法定位；但「断的那一刻频率是多少」可以从这条时间轴
+     * 反推 —— 如果每次断都伴随某几个核掉到最低频，schedutil 爬频这条假设就成立。
+     */
+    private final Runnable cpuSampleRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!sessionActive) return;
+            log("[CPU] " + CpuTuner.snapshot());
+            main.postDelayed(this, CPU_SAMPLE_INTERVAL_MS);
+        }
+    };
+
+    private void startCpuSampling() {
+        main.removeCallbacks(cpuSampleRunnable);
+        main.postDelayed(cpuSampleRunnable, CPU_SAMPLE_INTERVAL_MS);
+    }
+
+    private void stopCpuSampling() {
+        main.removeCallbacks(cpuSampleRunnable);
+    }
+
+    /**
+     * 会话结束时读一次 AudioFlinger 的累计欠载计数。
+     *
+     * <p>为什么不在断音当下抓：我们没有 AudioTrack 的句柄，也没有断音事件源。
+     * 但累计值是可加的 —— 相邻两场的差值就是「这一场被抽干了几次」，比抽日志可靠得多。
+     * dumpsys 输出可能几 MB，放后台线程，不占主线程。
+     */
+    private void dumpAudioUnderrunsAsync() {
+        if (!CpuTuner.rootGranted()) return;
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String dump = CpuTuner.exec("dumpsys media.audio_flinger");
+                if (dump == null) {
+                    log("[音频] dumpsys media.audio_flinger 执行失败");
+                    return;
+                }
+                int total = 0;
+                int shown = 0;
+                for (String line : dump.split("\n")) {
+                    if (!line.toLowerCase().contains("underrun")) continue;
+                    total++;
+                    if (shown < 8) {
+                        log("[音频] underrun | " + line.trim());
+                        shown++;
+                    }
+                }
+                if (total == 0) {
+                    log("[音频] dumpsys 无 underrun 字段（本版可能不统计，或本场无 track）");
+                } else {
+                    log("[音频] 本场结束时 underrun 字段 " + total + " 条（累计值，与上一场做差看增量）");
+                }
+            }
+        }, "icoca-audio-dump");
+        t.setDaemon(true);
+        t.start();
     }
 
     /**
@@ -2401,6 +2491,19 @@ public class IccoaManager {
                     }
                     // 连上就刷新一次通道标签：顺带做 5G 事后校验（A9）。
                     resolveTransportLabel();
+                    // ★ 0.3.21：会话级 CPU 档位与频率采样。
+                    //   state=4 与 state=2 会先后各来一次，用 cpuTuned 挡住第二次，
+                    //   否则日志里会出现两条「已切 performance」而实际只切了一次。
+                    if (!cpuTuned) {
+                        cpuTuned = true;
+                        log("[CPU] su 探测：" + CpuTuner.probe());
+                        if (IccoaPrefs.getBool(appCtx, IccoaPrefs.KEY_CPU_PERF, false)) {
+                            log("[CPU] " + CpuTuner.applyPerformance(appCtx));
+                        } else {
+                            log("[CPU] 实时档位未启用（icoca-cpu-perf=0），只采样不改");
+                        }
+                        startCpuSampling();
+                    }
                     break;
                 }
 

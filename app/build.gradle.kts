@@ -87,8 +87,8 @@ android {
         applicationId = "com.miauto.app"
         minSdk = 16
         targetSdk = 36
-        versionCode = 320
-        versionName = "0.3.20"
+        versionCode = 321
+        versionName = "0.3.21"
         setProperty("archivesBaseName", "${applicationId}_${versionName}")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         multiDexEnabled = true
@@ -344,8 +344,17 @@ dependencies {
 // =====================================================================
 val sdkDex = file("libs/icar-sdk.dex")
 val sdkDexBytes: ByteArray = if (sdkDex.exists()) sdkDex.readBytes() else ByteArray(0)
-val iccoaSdkHome = (System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT"))
+// 环境变量可能是「已设置但为空字符串」—— 那种情况下 file("") 会解析成项目根目录，
+// 于是 build-tools 永远找不到、静默退到下面那个硬编码路径。必须显式跳过空白值。
+// 三者都拿不到时再读 local.properties 的 sdk.dir（AGP 用的就是它），最后才退硬编码。
+val iccoaSdkHome = listOf("ANDROID_HOME", "ANDROID_SDK_ROOT")
+    .mapNotNull { System.getenv(it)?.takeIf { v -> v.isNotBlank() } }
+    .firstOrNull()
     ?.let { file(it) }
+    ?: rootProject.file("local.properties").takeIf { it.exists() }?.let { f ->
+        Properties().apply { FileInputStream(f).use { s -> load(s) } }
+            .getProperty("sdk.dir")?.takeIf { it.isNotBlank() }
+    }?.let { file(it) }
     ?: file("C:/Users/Administrator/AppData/Local/Android/Sdk")
 val iccoaBuildToolsDir = iccoaSdkHome.resolve("build-tools").listFiles()
     ?.filter { it.isDirectory }
