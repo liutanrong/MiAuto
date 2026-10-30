@@ -20,6 +20,7 @@ import com.ucar.vehiclesdk.ICarConnectListener;
 import com.ucar.vehiclesdk.ICarInitCallback;
 import com.ucar.vehiclesdk.IPhoneDataListener;
 import com.andrerinas.openheadunit.BuildConfig;
+import com.andrerinas.openheadunit.utils.AudioTrace;
 import com.ucar.vehiclesdk.UCarAdapter;
 import com.ucar.vehiclesdk.UCarCommon;
 import com.ucar.vehiclesdk.UCarConfig;
@@ -1403,6 +1404,9 @@ public class IccoaManager {
         fiveGLogged = false;
         main.removeCallbacks(linkLostRunnable);
         stopCpuSampling();
+        // 0.3.22：摘下追踪，但不清内容 —— 报告导出时要用整场的音频时间轴。
+        AudioTrace.stop();
+        log("[音频] " + AudioTrace.summary());
         if (cpuTuned) {
             cpuTuned = false;
             log("[CPU] " + CpuTuner.restore(appCtx));
@@ -2503,6 +2507,10 @@ public class IccoaManager {
                             log("[CPU] 实时档位未启用（icoca-cpu-perf=0），只采样不改");
                         }
                         startCpuSampling();
+                        // ★ 0.3.22：会话一开始就把 logcat 挂上。
+                        //   导出侧的 logcat -d 只能读到环形缓冲的尾巴（实测 4 秒），
+                        //   音频断面的证据永远落不进去。这里改成边产生边收。
+                        AudioTrace.start();
                     }
                     break;
                 }

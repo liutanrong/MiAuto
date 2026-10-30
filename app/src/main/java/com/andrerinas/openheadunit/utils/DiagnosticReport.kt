@@ -61,8 +61,22 @@ object DiagnosticReport {
         //   而音频输出走 AudioFlinger/AudioTrack，射频走 WifiP2pService/wpa_supplicant，
         //   两边一条都不进来。没有这两组日志，就只能猜「是不是网络」。
         //   只在诊断时段抓，不影响平时性能。
-        runCatching { readAudioRadioLogcat().forEach(::accept) }
-            .onFailure { accept("[diagnostic] audio/radio logcat unavailable: ${it.message}") }
+        // ★ 音频与射频（0.3.19 E3-2；0.3.22 改为整场追踪）。
+        //
+        //   前两版一直走下面的 readAudioRadioLogcat()，可它读的是 logcat 环形缓冲的尾巴：
+        //   三次报告实测都只有 4 秒。0.3.22 起由 AudioTrace 在会话期间常驻抓取，
+        //   这里优先取那份整场时间轴；取不到（没连过、追踪没起来）才退回 4 秒快照。
+        if (AudioTrace.hasContent()) {
+            accept("[audio] ==== 会话期间常驻追踪（整场；水位行只在数值变化时保留）====")
+            val all = AudioTrace.snapshot()
+            val tail = if (all.size > 1200) all.subList(all.size - 1200, all.size) else all
+            if (tail.size < all.size) accept("[audio] 共 ${all.size} 行，此处保留最后 ${tail.size} 行")
+            tail.forEach(::accept)
+        } else {
+            accept("[audio] 无常驻追踪记录（本进程未建立过会话，退回 logcat 快照）")
+            runCatching { readAudioRadioLogcat().forEach(::accept) }
+                .onFailure { accept("[diagnostic] audio/radio logcat unavailable: ${it.message}") }
+        }
 
         // ★ AudioFlinger 欠载计数（0.3.21）。
         //
@@ -89,6 +103,7 @@ object DiagnosticReport {
             appendLine("Logging level=${settings.exporterLogLevel}; source=${settings.logSource}")
             runCatching { appendLine("CPU: ${CpuTuner.snapshot()}") }
             runCatching { appendLine("SU: ${CpuTuner.probe()}") }
+            appendLine("Audio: ${AudioTrace.summary()}")
             appendLine("Saved credentials, network addresses and protocol payloads are omitted.")
             appendLine("--- Recent app logs (up to 6000 lines) ---")
             if (lines.isEmpty()) appendLine("No recent app logs available. Reproduce the issue and save a new report.")
@@ -225,11 +240,27 @@ object DiagnosticReport {
         val files = dir.listFiles { f -> f.isFile && f.name.startsWith("crash-") && f.name.endsWith(".txt") }
             ?: return emptyList()
         val latest = files.maxByOrNull { it.lastModified() } ?: return emptyList()
-        val head = latest.readLines().take(40)
-        if (head.isEmpty()) return emptyList()
+        val all = latest.readLines()
+        if (all.isEmpty()) return emptyList()
+        val head = all.take(40)
+        // ★ 0.3.22：只在崩溃版本等于当前版本时展开全文。
+        //   10/29 与 10/30 两份报告的 [crash] 段都是 0.3.18 留下的旧栈，
+        //   读报告的人会以为当轮又崩了一次 —— 实际上 0.3.20 起就再没崩过。
+        val crashedVersion = all.firstOrNull { it.startsWith("version=") }
+            ?.removePrefix("version=")?.trim()?.takeIf { it.isNotEmpty() }
+        val current = runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull()
+        val stale = crashedVersion != null && current != null && crashedVersion != current
         return buildList {
-            add("[crash] ==== ${latest.name}（共 ${latest.readLines().size} 行，此处前 ${head.size} 行）====")
-            addAll(head)
+            add("[crash] ==== ${latest.name}（共 ${all.size} 行${crashedVersion?.let { "，版本 $it" } ?: ""}）====")
+            if (stale) {
+                add("[crash] 该栈来自 $crashedVersion，当前已跑 $current —— 不是本轮的崩溃，只列异常行。")
+                add("[crash] " + (all.firstOrNull { it.contains("Exception") || it.contains("Error") }
+                    ?: head.first()))
+            } else {
+                addAll(head)
+            }
             add("[crash] ==== 结束 ====")
         }
     }

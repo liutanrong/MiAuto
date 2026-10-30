@@ -1,3 +1,57 @@
+# MiAuto 0.3.22 — 2026-10-30
+
+**Three hypotheses killed by the data; this release makes the moment of the dropout visible**
+
+The 10/30 report eliminated three lines of inquiry at once. That is good news: it saved
+three rounds of blind tuning.
+
+| Hypothesis | Reading | Verdict |
+|---|---|---|
+| CPU throttling / slow ramp-up | `gov=performance`, all eight cores at 1804/2016 MHz, 64 samples, no exception | **No** |
+| Audio focus being stolen repeatedly | 30 callbacks across three sessions; each session only `0->1` at start and `-5` at release | **No** |
+| Audio path being torn down and rebuilt | CAST_MUSIC track lived 227 s / 27.5 s / 584 s, built once per session | **No** |
+
+The first session is the cleanest: TTS ran +27 s to +38 s, then CAST_MUSIC lived from
++43 s to +270 s — **227 seconds undisturbed**. No focus theft, no rebuild, full clock,
+and the audio still dropped. That leaves exactly one candidate: **audio packets queuing
+behind video packets on the air interface**.
+
+- **A1 persistent in-session audio trace (AudioTrace).** The audio section of the last
+  three reports covered **4 seconds** each (0.3.21: 128 lines / 3.87 s). Raising the quota
+  from 500 to 760 in 0.3.21 was the wrong fix: the quota was never the bottleneck, the
+  length of the logcat ring buffer was. `UCar_AudioQueueManager-pcm` prints a dozen
+  `buffer queue size: 10` lines a second and fills this process's buffer within seconds,
+  so `logcat -d` can only ever return the tail. The trace now attaches at session start,
+  consumes the stream live, and keeps its own 1500-line ring — the export gets the
+  **whole session**, not the last four seconds.
+- **A2 record water level only when it changes.** Nothing is written while the queue sits
+  at full; every change down to 9 / 7 / 0 is written. Per-stream thresholds, because TTS
+  peaks at 5 and MUSIC at 10 and a single threshold would be meaningless for one of them.
+  One line at session end:
+
+  ```
+  [audio] session water level: STREAM_CAST_MUSIC peak 10 / min 3 / empty 0 / below half 12
+  ```
+
+  That is the number of dropouts and how deep each one went, in one line — also printed
+  in the report header.
+- **A3 stop the crash section from misleading.** Both the 10/29 and 10/30 reports carried a
+  `version=0.3.18-debug` stack, which reads like a fresh crash. The full stack is now only
+  expanded when the crashed version equals the running one.
+- **A4 su confirmed unavailable.** `isAppGrantedRoot=false`, so 0.3.21's A3
+  (`dumpsys media.audio_flinger` underrun counter) can never work on this head unit and is
+  replaced by A2's water-level statistics. The CPU governor switch was never needed either:
+  the unit already runs `performance`.
+
+**No changes to the casting path.** With three hypotheses just eliminated, touching frame
+rate, bitrate or resolution now would only muddy the next report's readings.
+
+**Next round: run this A/B inside the app (no reflash needed).** Settings -> video
+resolution, switch from the current **720p** to **480p**, run a session of 10+ minutes,
+then switch back and run another. Compare the two reports: if 480p shows clearly smaller
+`min / empty / below half` numbers, the air interface is the cause; if they are the same,
+the link is innocent and the next step is capturing on the head unit.
+
 # MiAuto 0.3.21 — 2026-10-29
 
 **Audio dropouts narrowed: nothing is lost, it is timing. Instruments first, then one optional knife**
